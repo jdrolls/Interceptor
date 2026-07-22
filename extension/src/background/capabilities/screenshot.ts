@@ -6,6 +6,17 @@ type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: 
 
 const CAPTURE_TIMEOUT_MS = 5000
 const DOM_RENDER_TIMEOUT_MS = 30_000
+// The content-script DOM-render roundtrip must time out BELOW the CLI's ~15s
+// WebSocket ceiling so the captureVisibleTab fallback (below) actually runs
+// before the CLI gives up. Do NOT raise this to DOM_RENDER_TIMEOUT_MS (30s) —
+// that is above the CLI ceiling and would strand the fallback.
+const DOM_RENDER_ROUNDTRIP_TIMEOUT_MS = 8000
+
+type DomRenderResult = {
+  success: boolean
+  error?: string
+  data?: { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string }
+}
 const VISIBILITY_HINT = "Chrome/Brave window may not be visible — bring it to the front and retry, or pass --tab <id> of a tab in a visible window."
 
 class CaptureTimeoutError extends Error {
@@ -159,7 +170,7 @@ async function handleDomRenderScreenshot(
   await installScreenshotCorsRule(tabId)
   try {
     const inject = await injectScreenshotRunner(tabId)
-    if (!inject.success) return { success: false, error: inject.error || "runner injection failed" }
+    if (!inject.success) return { success: false, error: inject.error || "runner injection failed", data: { layer: "executeScript" } }
 
     const dsAction: { type: string; [key: string]: unknown } = { type: "dom_screenshot", mode, format: renderFormat, quality }
     if (action.ref !== undefined) dsAction.ref = action.ref
@@ -169,10 +180,39 @@ async function handleDomRenderScreenshot(
     if (scale !== undefined) dsAction.scale = scale
     if (targetMaxLongEdge !== undefined) dsAction.target_max_long_edge = targetMaxLongEdge
 
-    const renderResult = await sendToContentScript(tabId, dsAction) as { success: boolean; error?: string; data?: { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string } }
+    let renderResult: DomRenderResult
+    try {
+      renderResult = await withCaptureTimeout(
+        "domRenderRoundtrip",
+        sendToContentScript(tabId, dsAction) as Promise<DomRenderResult>,
+        DOM_RENDER_ROUNDTRIP_TIMEOUT_MS
+      )
+    } catch (err) {
+      if (err instanceof CaptureTimeoutError) {
+        // The content-script roundtrip never replied within the sub-CLI-ceiling
+        // budget. Fall back to the pixel (captureVisibleTab) path so a capture
+        // still succeeds, instead of hanging until the CLI's ~15s WS timeout
+        // and surfacing as an opaque "dom render failed: undefined".
+        const fallback = await handlePixelScreenshot({ ...action, pixel: true }, tabId)
+        if (fallback.success && fallback.data && typeof fallback.data === "object") {
+          (fallback.data as Record<string, unknown>).fallback = "pixel (dom-render roundtrip timed out)"
+          return fallback
+        }
+        return {
+          success: false,
+          error: `dom-render roundtrip timed out after ${DOM_RENDER_ROUNDTRIP_TIMEOUT_MS}ms and captureVisibleTab fallback failed: ${fallback.error || "unknown error"}`,
+          data: { layer: "domRenderRoundtrip", timedOutMs: DOM_RENDER_ROUNDTRIP_TIMEOUT_MS }
+        }
+      }
+      throw err
+    }
 
     if (!renderResult || !renderResult.success || !renderResult.data) {
-      return { success: false, error: renderResult?.error || "dom render returned no data" }
+      return {
+        success: false,
+        error: renderResult?.error || "dom render returned no data (content-script roundtrip produced no result)",
+        data: { layer: "domRenderRoundtrip" }
+      }
     }
 
     let dataUrl = renderResult.data.dataUrl

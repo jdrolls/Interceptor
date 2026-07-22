@@ -214,4 +214,5 @@ Recording (Session Monitor):
 
 Meta:
   interceptor status                         Check daemon status (local — no connection needed)
+  interceptor doctor [--json] [--fix]        Health preflight; --fix restarts a degraded daemon
   interceptor help                           This help text`

@@ -21,6 +21,7 @@ import { runOverride } from "./commands/override"
 import { runMacosCommand } from "./commands/macos"
 import { runUpgradeCommand } from "./commands/upgrade"
 import { runInitCommand } from "./commands/init"
+import { runDoctorCommand } from "./commands/doctor"
 import { VERSION, BUILD_SHA, BUILD_DATE } from "./version"
 
 // Command → module routing
@@ -42,10 +43,11 @@ const OVERRIDE_CMDS = new Set(["override"])
 const MACOS_CMDS = new Set(["macos"])
 const UPGRADE_CMDS = new Set(["upgrade"])
 const INIT_CMDS = new Set(["init"])
+const DOCTOR_CMDS = new Set(["doctor"])
 
 // Commands that don't require a daemon connection (or, in init's case,
 // bootstrap it themselves rather than relying on the pre-dispatch auto-spawn).
-const NO_DAEMON = new Set(["status", "help", "events", "session", "upgrade", "init"])
+const NO_DAEMON = new Set(["status", "help", "events", "session", "upgrade", "init", "doctor"])
 
 // Every command the CLI dispatches. Used to reject unknown commands
 // before any daemon-spawning side effect runs.
@@ -54,7 +56,7 @@ const ALL_KNOWN_CMDS = new Set<string>([
   ...SS_CMDS, ...DATA_CMDS, ...META_CMDS, ...EVAL_CMDS,
   ...BATCH_CMDS, ...MONITOR_CMDS, ...SCENE_CMDS, ...SSE_CMDS,
   ...COMPOUND_CMDS, ...OVERRIDE_CMDS, ...MACOS_CMDS,
-  ...UPGRADE_CMDS, ...INIT_CMDS,
+  ...UPGRADE_CMDS, ...INIT_CMDS, ...DOCTOR_CMDS,
   "help",
 ])
 
@@ -148,6 +150,11 @@ async function main() {
 
   if (INIT_CMDS.has(cmd)) {
     await runInitCommand(filtered)
+    return
+  }
+
+  if (DOCTOR_CMDS.has(cmd)) {
+    await runDoctorCommand(filtered, { jsonMode })
     return
   }
 

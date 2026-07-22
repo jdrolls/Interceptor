@@ -87,16 +87,35 @@ export async function handleDaemonMessage(msg: {
 
   const action = msg.action
   let tabId = msg.tabId
+  // How the target tab was resolved. Non-explicit resolution (stored/active-drift)
+  // is the wrong-tab-routing risk surfaced on the response below so a command
+  // that lands on the wrong page can't be a silent false-pass.
+  let tabResolvedVia: "explicit" | "stored" | "active-drift" | undefined =
+    tabId !== undefined ? "explicit" : undefined
 
   if (!tabId && needsTab(action.type)) {
     const stored = await chrome.storage.session.get("activeTabId") as { activeTabId?: number }
-    tabId = stored.activeTabId
+    if (stored.activeTabId !== undefined) {
+      // Validate the stored tab is still live before trusting it — a stale id
+      // (tab closed) would otherwise silently route to the wrong place. If it's
+      // gone, clear it and fall through to the active-tab query.
+      try {
+        await chrome.tabs.get(stored.activeTabId)
+        tabId = stored.activeTabId
+        tabResolvedVia = "stored"
+      } catch {
+        try { await chrome.storage.session.remove("activeTabId") } catch {}
+      }
+    }
   }
 
   if (!tabId && needsTab(action.type)) {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true })
     tabId = activeTab?.id
-    if (tabId) chrome.storage.session.set({ activeTabId: tabId })
+    if (tabId) {
+      tabResolvedVia = "active-drift"
+      chrome.storage.session.set({ activeTabId: tabId })
+    }
   }
 
   if (!tabId && needsTab(action.type)) {
@@ -137,6 +156,16 @@ export async function handleDaemonMessage(msg: {
   try {
     const result = await routeAction(action, tabId!)
     if (tabId) result.tabId = tabId
+    // Surface non-explicit tab resolution so a wrong-page verification can't be
+    // a silent false-pass. Additive metadata only; never overwrite existing keys.
+    if ((tabResolvedVia === "stored" || tabResolvedVia === "active-drift") &&
+        result.data && typeof result.data === "object") {
+      const d = result.data as Record<string, unknown>
+      if (d.tabResolvedVia === undefined) d.tabResolvedVia = tabResolvedVia
+      if (d.resolvedTabUrl === undefined) {
+        try { d.resolvedTabUrl = (await chrome.tabs.get(tabId!)).url } catch {}
+      }
+    }
     clearTimeout(requestTimer)
     pendingRequests.delete(msg.id)
     console.log(`[${shortId}] complete ${action.type} ${Date.now() - startTime}ms`)
