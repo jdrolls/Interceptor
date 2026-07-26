@@ -9,21 +9,19 @@
  */
 
 import { existsSync, readFileSync, unlinkSync } from "node:fs"
-import { PID_PATH, SOCKET_PATH } from "../../shared/platform"
+import { EVENTS_PATH, PID_PATH, SOCKET_PATH } from "../../shared/platform"
 import { sendCommand } from "../transport"
 import { ensureDaemon } from "../daemon-spawn"
 
-const EVENTS_PATH = "/tmp/interceptor-events.jsonl"
 const TAB_ACCUMULATION_LIMIT = 8
 
 type Check = { name: string; ok: boolean; detail: string }
 type DoctorEvent = { timestamp?: string; error?: string; event?: string }
 
 /**
- * Pure degradation detector: counts events whose `error` contains "timeout"
- * (case-insensitive) within the last `windowMs`, and reports `degraded` once
- * that count reaches `threshold`. Extracted as a pure function so it is
- * testable without a live daemon or browser.
+ * The daemon historically recorded only request lifecycle events, leaving
+ * doctor blind to client-side timeouts. Count explicit timeout events too,
+ * while retaining compatibility with legacy error-bearing entries.
  */
 export function detectRecentTimeouts(
   events: DoctorEvent[],
@@ -33,8 +31,9 @@ export function detectRecentTimeouts(
 ): { degraded: boolean; count: number } {
   let count = 0
   for (const ev of events) {
-    if (!ev || typeof ev.error !== "string") continue
-    if (!ev.error.toLowerCase().includes("timeout")) continue
+    if (!ev) continue
+    const isTimeout = (typeof ev.error === "string" && ev.error.toLowerCase().includes("timeout")) || ev.event === "request_timeout"
+    if (!isTimeout) continue
     if (ev.timestamp) {
       const t = new Date(ev.timestamp).getTime()
       if (!Number.isNaN(t) && t < now - windowMs) continue
@@ -87,6 +86,20 @@ function readEvents(): DoctorEvent[] {
     return out
   } catch {
     return []
+  }
+}
+
+/**
+ * A restarted daemon is reachable before the extension has re-established its
+ * WebSocket to it (measured: ~2s). Re-checking immediately therefore reports a
+ * SUCCESSFUL self-heal as a failed one, which is worse than not healing at all
+ * for anything automating on the exit code. Poll instead of guessing a sleep.
+ */
+async function waitForExtension(maxMs = 10_000, intervalMs = 500): Promise<void> {
+  const until = Date.now() + maxMs
+  while (Date.now() < until) {
+    if ((await probeExtension()).ok) return
+    await new Promise(r => setTimeout(r, intervalMs))
   }
 }
 
@@ -173,6 +186,7 @@ export async function runDoctorCommand(filtered: string[], opts: { jsonMode: boo
     } catch (err) {
       process.stderr.write(`daemon restart failed: ${(err as Error).message}\n`)
     }
+    await waitForExtension()
     process.stderr.write("→ re-checking after restart...\n")
     checks = await runChecks()
     degraded = report(checks, opts.jsonMode)

@@ -881,11 +881,14 @@ try {
           }
 
           const timer = setTimeout(() => {
+            const pending = pendingRequests.get(id)
             pendingRequests.delete(id)
             timedOutRequests.add(id)
             setTimeout(() => timedOutRequests.delete(id), 60_000)
+            const duration = pending ? Date.now() - pending.startTime : REQUEST_TIMEOUT_MS
+            const error = `timeout: no response for '${actionType}' after ${duration}ms`
             log(`request timeout: ${id}`)
-            emitEvent("request_timeout", { requestId: id, action: actionType })
+            emitEvent("request_timeout", { requestId: id, action: actionType, duration, error })
             socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: "timeout" } }))
           }, REQUEST_TIMEOUT_MS)
           pendingRequests.set(id, {
@@ -986,10 +989,14 @@ try {
 
         const actionType = (request.action as { type?: string })?.type || "unknown"
         const timer = setTimeout(() => {
+          const pending = pendingRequests.get(id)
           pendingRequests.delete(id)
           timedOutRequests.add(id)
           setTimeout(() => timedOutRequests.delete(id), 60_000)
+          const duration = pending ? Date.now() - pending.startTime : REQUEST_TIMEOUT_MS
+          const error = `timeout: no response for '${actionType}' after ${duration}ms`
           log(`ws request timeout: ${id}`)
+          emitEvent("request_timeout", { requestId: id, action: actionType, duration, error })
           ws.send(JSON.stringify({ id, result: { success: false, error: "timeout" } }))
         }, REQUEST_TIMEOUT_MS)
 
@@ -1021,6 +1028,9 @@ function gracefulShutdown(signal: string) {
   log(`${signal} received, draining ${pendingRequests.size} pending requests`)
   for (const [id, req] of pendingRequests) {
     clearTimeout(req.timer)
+    const duration = Date.now() - req.startTime
+    const error = `timeout: daemon shut down before '${req.actionType}' completed after ${duration}ms`
+    emitEvent("request_timeout", { requestId: id, action: req.actionType, duration, error })
     socketWriteFramed(req.socket, JSON.stringify({ id, result: { success: false, error: "daemon shutting down" } }))
   }
   pendingRequests.clear()

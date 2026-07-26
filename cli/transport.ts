@@ -2,7 +2,8 @@
  * cli/transport.ts — sendCommand (Unix socket / TCP) and sendCommandWs (WebSocket)
  */
 
-import { IPC_PORT, IS_WIN, SOCKET_PATH, WS_PORT } from "../shared/platform"
+import { appendFile } from "node:fs"
+import { EVENTS_PATH, IPC_PORT, IS_WIN, SOCKET_PATH, WS_PORT } from "../shared/platform"
 
 export const INTERCEPTOR_TIMEOUT_MS = parseInt(process.env.INTERCEPTOR_TIMEOUT || "15000")
 
@@ -11,6 +12,12 @@ export type DaemonResult = { success: boolean; error?: string; data?: unknown; t
 export type DaemonResponse = {
   id: string
   result: DaemonResult
+}
+
+function recordTimeout(action: Action, error: string): void {
+  try {
+    appendFile(EVENTS_PATH, JSON.stringify({ timestamp: new Date().toISOString(), event: "request_timeout", action: action.type, error }) + "\n", () => {})
+  } catch {}
 }
 
 export function sendCommand(action: Action, tabId?: number): Promise<DaemonResponse> {
@@ -26,7 +33,9 @@ export function sendCommand(action: Action, tabId?: number): Promise<DaemonRespo
       if (!resolved) {
         resolved = true
         if (socketRef) try { socketRef.end() } catch {}
-        reject(new Error(`timeout: no response for '${action.type}' after ${INTERCEPTOR_TIMEOUT_MS / 1000}s. Ensure Chrome/Brave is open with the Interceptor extension loaded.`))
+        const error = `timeout: no response for '${action.type}' after ${INTERCEPTOR_TIMEOUT_MS / 1000}s. Ensure Chrome/Brave is open with the Interceptor extension loaded.`
+        recordTimeout(action, error)
+        reject(new Error(error))
       }
     }, INTERCEPTOR_TIMEOUT_MS)
 
@@ -88,7 +97,9 @@ export function sendCommandWs(action: Action, tabId?: number): Promise<DaemonRes
     process.stderr.write(`[${shortId}] →ws ${action.type}\n`)
 
     const timer = setTimeout(() => {
-      reject(new Error(`timeout: no response for '${action.type}' after ${INTERCEPTOR_TIMEOUT_MS / 1000}s via WebSocket.`))
+      const error = `timeout: no response for '${action.type}' after ${INTERCEPTOR_TIMEOUT_MS / 1000}s via WebSocket.`
+      recordTimeout(action, error)
+      reject(new Error(error))
     }, INTERCEPTOR_TIMEOUT_MS)
 
     const ws = new WebSocket(`ws://localhost:${WS_PORT}`)
