@@ -10,7 +10,14 @@ import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
 import { parseElementTarget } from "../parse"
 
 type Action = { type: string; [key: string]: unknown }
-type Result = { success: boolean; error?: string; data?: unknown; tabId?: number }
+type Result = {
+  success: boolean
+  error?: string
+  data?: unknown
+  tabId?: number
+  tabResolvedVia?: "stored" | "active-drift"
+  resolvedTabUrl?: string
+}
 type ReadAggregate = {
   success: boolean
   tree?: string
@@ -79,6 +86,20 @@ export function aggregateReadResults(opts: {
   }
 
   return { success: true, tree: tree || undefined, text: text || undefined, warnings }
+}
+
+export function readRoutingFrom(
+  treeResult?: Result,
+  textResult?: Result
+): Pick<Result, "tabId" | "tabResolvedVia" | "resolvedTabUrl"> {
+  const result = [treeResult, textResult].find(candidate => candidate?.success)
+  if (!result) return {}
+
+  return {
+    ...(result.tabId !== undefined && { tabId: result.tabId }),
+    ...(result.tabResolvedVia !== undefined && { tabResolvedVia: result.tabResolvedVia }),
+    ...(result.resolvedTabUrl !== undefined && { resolvedTabUrl: result.resolvedTabUrl })
+  }
 }
 
 type ReadTarget = ReturnType<typeof parseElementTarget> | Record<string, never>
@@ -302,9 +323,25 @@ export async function runRead(
   textContent = aggregate.text || ""
 
   if (jsonMode) {
-    const result: { success: boolean; data?: unknown; warning?: string } = {
+    const routing = readRoutingFrom(treeResult, textResult)
+    const result: {
+      success: boolean
+      data?: unknown
+      warning?: string
+      tabId?: number
+      tabResolvedVia?: "stored" | "active-drift"
+      resolvedTabUrl?: string
+    } = {
       success: true,
-      data: { tree: treeData || undefined, text: textContent || undefined }
+      data: {
+        ...(globalTabId !== undefined && { tabId: globalTabId }),
+        ...(globalTabId === undefined && routing.tabId !== undefined && { tabId: routing.tabId }),
+        tree: treeData || undefined,
+        text: textContent || undefined
+      },
+      ...(routing.tabId !== undefined && { tabId: routing.tabId }),
+      ...(routing.tabResolvedVia !== undefined && { tabResolvedVia: routing.tabResolvedVia }),
+      ...(routing.resolvedTabUrl !== undefined && { resolvedTabUrl: routing.resolvedTabUrl })
     }
     if (aggregate.warnings?.length) result.warning = aggregate.warnings.join("; ")
     output(jsonMode, result)

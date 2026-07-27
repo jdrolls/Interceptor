@@ -1,6 +1,7 @@
 import { sendToHost, activeTransport, connectToHost, connectWsChannel } from "./transport"
 import { isTabInInterceptorGroup, interceptorGroupId, ensureInterceptorGroup, SENSITIVE_ACTIONS, verifyTabUrl } from "./tab-group"
 import { routeAction } from "./router"
+import { applyTabProvenance, type TabResolvedVia } from "./tab-provenance"
 
 export const MESSAGE_QUEUE_CAP = 50
 export const messageQueue: Array<{
@@ -90,7 +91,7 @@ export async function handleDaemonMessage(msg: {
   // How the target tab was resolved. Non-explicit resolution (stored/active-drift)
   // is the wrong-tab-routing risk surfaced on the response below so a command
   // that lands on the wrong page can't be a silent false-pass.
-  let tabResolvedVia: "explicit" | "stored" | "active-drift" | undefined =
+  let tabResolvedVia: TabResolvedVia | undefined =
     tabId !== undefined ? "explicit" : undefined
 
   if (!tabId && needsTab(action.type)) {
@@ -154,18 +155,16 @@ export async function handleDaemonMessage(msg: {
   }
 
   try {
-    const result = await routeAction(action, tabId!)
+    let result = await routeAction(action, tabId!)
     if (tabId) result.tabId = tabId
-    // Surface non-explicit tab resolution so a wrong-page verification can't be
-    // a silent false-pass. Additive metadata only; never overwrite existing keys.
-    if ((tabResolvedVia === "stored" || tabResolvedVia === "active-drift") &&
-        result.data && typeof result.data === "object") {
-      const d = result.data as Record<string, unknown>
-      if (d.tabResolvedVia === undefined) d.tabResolvedVia = tabResolvedVia
-      if (d.resolvedTabUrl === undefined) {
-        try { d.resolvedTabUrl = (await chrome.tabs.get(tabId!)).url } catch {}
-      }
-    }
+    // Surface non-explicit tab resolution on the response envelope so a
+    // wrong-page verification can't be a silent false-pass without changing
+    // the caller's returned data.
+    result = await applyTabProvenance(
+      result,
+      tabResolvedVia,
+      async () => (await chrome.tabs.get(tabId!)).url
+    )
     clearTimeout(requestTimer)
     pendingRequests.delete(msg.id)
     console.log(`[${shortId}] complete ${action.type} ${Date.now() - startTime}ms`)

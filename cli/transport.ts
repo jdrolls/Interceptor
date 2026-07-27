@@ -8,7 +8,14 @@ import { EVENTS_PATH, IPC_PORT, IS_WIN, SOCKET_PATH, WS_PORT } from "../shared/p
 export const INTERCEPTOR_TIMEOUT_MS = parseInt(process.env.INTERCEPTOR_TIMEOUT || "15000")
 
 export type Action = { type: string; [key: string]: unknown }
-export type DaemonResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
+export type DaemonResult = {
+  success: boolean
+  error?: string
+  data?: unknown
+  tabId?: number
+  tabResolvedVia?: "stored" | "active-drift"
+  resolvedTabUrl?: string
+}
 export type DaemonResponse = {
   id: string
   result: DaemonResult
