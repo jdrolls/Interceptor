@@ -19,7 +19,7 @@ export async function parseTabsCommand(filtered: string[]): Promise<Action | nul
     case "tab":
       switch (filtered[1]) {
         case "new":
-          return { type: "tab_create", url: filtered[2] }
+          return { type: "tab_create", url: filtered[2], ...(filtered.includes("--new") ? { forceNew: true } : {}) }
         case "close":
           return filtered[2]
             ? { type: "tab_close", tabId: parseInt(filtered[2]) }

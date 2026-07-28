@@ -6,7 +6,8 @@
  * combines the results into a single output.
  */
 
-import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
+import { type DaemonResponse } from "../transport"
+import { sendWithRecovery } from "../lib/self-heal"
 import { parseElementTarget } from "../parse"
 
 type Action = { type: string; [key: string]: unknown }
@@ -44,9 +45,7 @@ function truncateText(text: string, maxChars: number): string {
 
 async function send(action: Action, tabId?: number, useWs = false): Promise<Result> {
   try {
-    const resp = useWs
-      ? await sendCommandWs(action, tabId)
-      : await sendCommand(action, tabId)
+    const resp = await sendWithRecovery(action, tabId, useWs)
     return unwrap(resp)
   } catch (err) {
     return { success: false, error: (err as Error).message }
@@ -150,11 +149,12 @@ export async function runOpen(
   const textOnly = filtered.includes("--text-only")
   const full = filtered.includes("--full")
   const noWait = filtered.includes("--no-wait")
+  const forceNew = filtered.includes("--new")
   const timeoutIdx = filtered.indexOf("--timeout")
   const timeout = timeoutIdx !== -1 ? parseInt(filtered[timeoutIdx + 1]) : 5000
 
   // Step 1: Create tab
-  const createResult = await send({ type: "tab_create", url }, globalTabId, useWs)
+  const createResult = await send({ type: "tab_create", url, ...(forceNew ? { forceNew: true } : {}) }, globalTabId, useWs)
   if (!createResult.success) {
     output(jsonMode, { success: false, error: createResult.error || "failed to create tab" })
     return

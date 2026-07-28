@@ -1,7 +1,8 @@
 import { HELP, helpForCommand } from "./help"
 import { parseTabFlag } from "./parse"
 import { formatState, formatTabs, formatCookies, formatResult } from "./format"
-import { sendCommand, sendCommandWs, type DaemonResult, type DaemonResponse } from "./transport"
+import { type DaemonResult, type DaemonResponse } from "./transport"
+import { sendWithRecovery } from "./lib/self-heal"
 import { ensureDaemon } from "./daemon-spawn"
 import { parseStateCommand } from "./commands/state"
 import { parseActionsCommand } from "./commands/actions"
@@ -201,9 +202,7 @@ async function main() {
     while (Date.now() - startTime < timeout) {
       try {
         const chunkAction = { type: "sse_chunk", filter, since: offset }
-        const resp = useWs
-          ? await sendCommandWs(chunkAction, globalTabId)
-          : await sendCommand(chunkAction, globalTabId)
+        const resp = await sendWithRecovery(chunkAction, globalTabId, useWs)
         const result = unwrapResult(resp)
         if (result?.success && result.data) {
           const d = result.data as { active: boolean; text?: string; offset?: number }
@@ -232,9 +231,7 @@ async function main() {
   }
 
   try {
-    const response = useWs
-      ? await sendCommandWs(action, globalTabId)
-      : await sendCommand(action, globalTabId)
+    const response = await sendWithRecovery(action, globalTabId, useWs)
     const result = unwrapResult(response)
 
     // Screenshot save-to-disk post-processing

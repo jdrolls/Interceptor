@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { detectRecentTimeouts } from "../cli/commands/doctor"
+import { countManagedTabs } from "../cli/lib/daemon-health"
 import { deriveStageBudget } from "../extension/src/background/capabilities/screenshot-budget"
 
 describe("doctor: detectRecentTimeouts", () => {
@@ -49,6 +50,30 @@ describe("doctor: detectRecentTimeouts", () => {
       Array.from({ length: n }, (_, i) => ({ timestamp: iso(NOW - i * 1_000), error: "timeout" }))
     expect(detectRecentTimeouts(mk(2), NOW).degraded).toBe(false)
     expect(detectRecentTimeouts(mk(3), NOW).degraded).toBe(true)
+  })
+})
+
+describe("doctor: countManagedTabs", () => {
+  test("empty tabs → 0", () => {
+    expect(countManagedTabs([])).toBe(0)
+  })
+
+  test("counts only tabs explicitly marked managed", () => {
+    expect(countManagedTabs([
+      { managed: true },
+      { managed: false },
+      {},
+      { managed: true },
+    ])).toBe(2)
+  })
+
+  test("4 managed plus 8 unmanaged tabs observed live does not trip the limit of 8", () => {
+    const tabs = [
+      ...Array.from({ length: 4 }, () => ({ managed: true })),
+      ...Array.from({ length: 8 }, () => ({ managed: false })),
+    ]
+    expect(countManagedTabs(tabs)).toBe(4)
+    expect(countManagedTabs(tabs)).toBeLessThanOrEqual(8)
   })
 })
 
