@@ -9,6 +9,7 @@
 import { type DaemonResponse } from "../transport"
 import { sendWithRecovery } from "../lib/self-heal"
 import { parseElementTarget } from "../parse"
+import type { TabResolvedVia } from "../../shared/tab-provenance"
 
 type Action = { type: string; [key: string]: unknown }
 type Result = {
@@ -16,7 +17,7 @@ type Result = {
   error?: string
   data?: unknown
   tabId?: number
-  tabResolvedVia?: "stored" | "active-drift"
+  tabResolvedVia?: "stored" | "active-cold" | "active-drift"
   resolvedTabUrl?: string
 }
 type ReadAggregate = {
@@ -329,7 +330,7 @@ export async function runRead(
       data?: unknown
       warning?: string
       tabId?: number
-      tabResolvedVia?: "stored" | "active-drift"
+      tabResolvedVia?: TabResolvedVia
       resolvedTabUrl?: string
     } = {
       success: true,

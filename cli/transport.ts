@@ -4,6 +4,7 @@
 
 import { appendFile } from "node:fs"
 import { EVENTS_PATH, IPC_PORT, IS_WIN, SOCKET_PATH, WS_PORT } from "../shared/platform"
+import type { TabResolvedVia } from "../shared/tab-provenance"
 
 export const INTERCEPTOR_TIMEOUT_MS = parseInt(process.env.INTERCEPTOR_TIMEOUT || "15000")
 
@@ -13,7 +14,7 @@ export type DaemonResult = {
   error?: string
   data?: unknown
   tabId?: number
-  tabResolvedVia?: "stored" | "active-drift"
+  tabResolvedVia?: "stored" | "active-cold" | "active-drift"
   resolvedTabUrl?: string
 }
 export type DaemonResponse = {
@@ -25,6 +26,11 @@ function recordTimeout(action: Action, error: string): void {
   try {
     appendFile(EVENTS_PATH, JSON.stringify({ timestamp: new Date().toISOString(), event: "request_timeout", action: action.type, error }) + "\n", () => {})
   } catch {}
+}
+
+function allowTabDrift(): boolean {
+  const value = process.env.INTERCEPTOR_ALLOW_TAB_DRIFT?.toLowerCase()
+  return value === "1" || value === "true"
 }
 
 export function sendCommand(action: Action, tabId?: number): Promise<DaemonResponse> {
@@ -49,7 +55,7 @@ export function sendCommand(action: Action, tabId?: number): Promise<DaemonRespo
     const socketHandlers: Bun.SocketHandler<undefined> = {
       open(socket: Bun.Socket<undefined>) {
         socketRef = socket
-        const payload = JSON.stringify({ id, action, ...(tabId !== undefined && { tabId }) })
+        const payload = JSON.stringify({ id, action, ...(tabId !== undefined && { tabId }), ...(allowTabDrift() && { allowTabDrift: true }) })
         const encoded = Buffer.from(payload, "utf-8")
         const header = Buffer.alloc(4)
         header.writeUInt32LE(encoded.byteLength, 0)
@@ -111,7 +117,7 @@ export function sendCommandWs(action: Action, tabId?: number): Promise<DaemonRes
 
     const ws = new WebSocket(`ws://localhost:${WS_PORT}`)
     ws.onopen = () => {
-      ws.send(JSON.stringify({ id, action, ...(tabId !== undefined && { tabId }) }))
+      ws.send(JSON.stringify({ id, action, ...(tabId !== undefined && { tabId }), ...(allowTabDrift() && { allowTabDrift: true }) }))
     }
     ws.onmessage = (event) => {
       clearTimeout(timer)

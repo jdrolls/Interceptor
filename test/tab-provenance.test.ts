@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { applyTabProvenance } from "../extension/src/background/tab-provenance"
+import { applyTabProvenance, resolveTabFallback } from "../extension/src/background/tab-provenance"
 
 describe("tab provenance", () => {
   test("adds stored provenance to a scalar result envelope", async () => {
@@ -44,16 +44,47 @@ describe("tab provenance", () => {
     expect(result).toEqual({ success: true, data: "explicit" })
   })
 
-  test("adds active-drift provenance to the envelope", async () => {
-    const result = await applyTabProvenance(
-      { success: true, data: null },
-      "active-drift",
-      async () => "https://example.com/active"
-    )
+  test("labels and permits active-cold fallback", async () => {
+    const resolution = resolveTabFallback({
+      activeTab: { id: 42, url: "https://example.com/cold" }
+    })
+    expect(resolution).toEqual({
+      success: true,
+      tabId: 42,
+      tabResolvedVia: "active-cold"
+    })
 
-    expect(result).toMatchObject({
+    const result = await applyTabProvenance(
+      { success: true, tabId: 42 },
+      resolution.success ? resolution.tabResolvedVia : undefined,
+      async () => "https://example.com/cold"
+    )
+    expect(result).toMatchObject({ tabResolvedVia: "active-cold" })
+  })
+
+  test("refuses active-drift by default with machine-readable provenance", () => {
+    const result = resolveTabFallback({
+      activeTab: { id: 99, url: "https://example.com/new" },
+      staleStoredTabId: 42
+    })
+
+    expect(result).toEqual({
+      success: false,
+      tabId: 99,
       tabResolvedVia: "active-drift",
-      resolvedTabUrl: "https://example.com/active"
+      error: "stored tab 42 is gone; refusing to silently run on tab 99 (https://example.com/new) — pass --tab explicitly, run 'interceptor open <url>', or set INTERCEPTOR_ALLOW_TAB_DRIFT=1"
+    })
+  })
+
+  test("allows and labels active-drift only when explicitly opted out", () => {
+    expect(resolveTabFallback({
+      activeTab: { id: 99, url: "https://example.com/new" },
+      staleStoredTabId: 42,
+      allowTabDrift: true
+    })).toEqual({
+      success: true,
+      tabId: 99,
+      tabResolvedVia: "active-drift"
     })
   })
 

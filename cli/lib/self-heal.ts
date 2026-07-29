@@ -73,7 +73,7 @@ export async function sendWithRecovery(
     healed = true
     process.stderr.write(`⚠ interceptor: degraded (${timeouts.count} timeouts in 60s) — self-healing: restarting daemon…\n`)
     try {
-      restartDaemon()
+      await restartDaemon()
       await ensureDaemon()
       await waitForExtension()
     } catch (healErr) {

@@ -14,6 +14,9 @@ import { ensureDaemon } from "../daemon-spawn"
 import {
   TAB_ACCUMULATION_LIMIT,
   detectRecentTimeouts,
+  detectSplitBrain,
+  findDaemonPids,
+  findWsPortOwner,
   isDaemonAlive,
   probeExtension,
   readEvents,
@@ -45,6 +48,15 @@ async function runChecks(): Promise<Check[]> {
   if (daemon.alive) {
     const probe = await probeExtension()
     checks.push({ name: "extension", ok: probe.ok, detail: probe.detail })
+    if (!probe.ok) {
+      const splitBrain = detectSplitBrain({
+        daemonPid: daemon.pid ?? null,
+        wsOwnerPid: await findWsPortOwner(),
+        extensionOk: probe.ok,
+        daemonPids: await findDaemonPids(),
+      })
+      checks.push({ name: "split-brain", ok: !splitBrain.split, detail: splitBrain.detail })
+    }
     if (probe.ok) {
       const overLimit = probe.managedTabCount > TAB_ACCUMULATION_LIMIT
       checks.push({
@@ -93,7 +105,7 @@ export async function runDoctorCommand(filtered: string[], opts: { jsonMode: boo
 
   if (degraded && doFix) {
     process.stderr.write("→ restarting daemon...\n")
-    restartDaemon()
+    await restartDaemon()
     try {
       await ensureDaemon()
     } catch (err) {

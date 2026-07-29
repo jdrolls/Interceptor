@@ -1,3 +1,4 @@
+import type { TabResolvedVia } from "../../../shared/tab-provenance"
 import { sendToContentScript } from "./content-bridge"
 import { activeTransport } from "./transport"
 import { handleOsInputActions } from "./capabilities/os-input"
@@ -31,7 +32,7 @@ export type ActionResult = {
   error?: string
   data?: unknown
   tabId?: number
-  tabResolvedVia?: "stored" | "active-drift"
+  tabResolvedVia?: TabResolvedVia
   resolvedTabUrl?: string
 }
 

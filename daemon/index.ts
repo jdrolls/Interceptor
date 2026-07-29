@@ -420,7 +420,8 @@ if (existsSync(PID_PATH)) {
   } catch {}
 }
 
-try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH) } catch {}
+// Do not touch the CLI socket until we have claimed the authoritative WS port.
+// A stale pidfile must never cause this process to unlink a live daemon socket.
 
 const pendingRequests = new Map<string, {
   resolve: (v: string) => void
@@ -802,9 +803,10 @@ async function handleOsAction(
 }
 
 let socketServer: Bun.TCPSocketListener<undefined> | Bun.UnixSocketListener<undefined> | null = null
+let socketHandlers: Bun.SocketHandler<undefined>
 
 try {
-  const socketHandlers: Bun.SocketHandler<undefined> = {
+  socketHandlers = {
       open(socket: Bun.Socket<undefined>) {
         socketBuffers.set(socket, Buffer.alloc(0))
         log("cli connected via socket")
@@ -824,7 +826,7 @@ try {
           const jsonBuf = buf.subarray(4, 4 + msgLen)
           buf = buf.subarray(4 + msgLen)
 
-          let request: { id?: string; action?: unknown; tabId?: number; type?: string }
+          let request: { id?: string; action?: unknown; tabId?: number; allowTabDrift?: boolean; type?: string }
           try {
             request = JSON.parse(jsonBuf.toString("utf-8"))
           } catch {
@@ -902,7 +904,7 @@ try {
             actionType
           })
 
-          sendNativeMessage({ id, action: request.action, tabId: request.tabId })
+          sendNativeMessage({ id, action: request.action, tabId: request.tabId, allowTabDrift: request.allowTabDrift })
         }
 
         socketBuffers.set(socket, buf)
@@ -923,19 +925,10 @@ try {
         log(`socket error: ${err.message}`)
       }
     }
-  if (IS_WIN) {
-    socketServer = Bun.listen({ hostname: "127.0.0.1", port: IPC_PORT, socket: socketHandlers })
-  } else {
-    socketServer = Bun.listen({ unix: SOCKET_PATH, socket: socketHandlers })
-  }
-  log(`socket listening on ${transportLabel()}`)
 } catch (err) {
-  log(`socket listen failed: ${(err as Error).message}`)
+  log(`socket handler setup failed: ${(err as Error).message}`)
   process.exit(1)
 }
-
-Bun.write(PID_PATH, `${process.pid}\n${transportLabel()}\n`)
-log(`pid file written: ${process.pid}`)
 
 let wsServer: ReturnType<typeof Bun.serve> | null = null
 try {
@@ -952,7 +945,7 @@ try {
       message(ws, raw) {
         const rawStr = typeof raw === "string" ? raw : Buffer.from(raw).toString("utf-8")
         log(`ws recv: ${rawStr.slice(0, 300)}`)
-        let request: { id?: string; action?: unknown; tabId?: number; type?: string; result?: unknown }
+        let request: { id?: string; action?: unknown; tabId?: number; allowTabDrift?: boolean; type?: string; result?: unknown }
         try {
           request = JSON.parse(rawStr)
         } catch {
@@ -1011,7 +1004,7 @@ try {
           actionType
         })
 
-        sendNativeMessage({ id, action: request.action, tabId: request.tabId })
+        sendNativeMessage({ id, action: request.action, tabId: request.tabId, allowTabDrift: request.allowTabDrift })
       },
       close(ws) {
         if ((ws as any).__isExtension) extensionWs = null
@@ -1021,8 +1014,36 @@ try {
   })
   log(`ws server listening on port ${WS_PORT}`)
 } catch (err) {
-  log(`ws server failed (port ${WS_PORT} in use?) — continuing without WebSocket: ${(err as Error).message}`)
+  // A STANDALONE daemon reaches the extension only over this WebSocket. Losing
+  // the bind while still claiming the CLI socket is precisely the split brain
+  // (dora-cc#880): the CLI talks here, the extension talks to the port owner,
+  // and every request times out. Refuse to exist instead.
+  if (STANDALONE) {
+    log(`another daemon already owns ws port ${WS_PORT} — exiting (extension is served by it): ${(err as Error).message}`)
+    process.exit(0)
+  }
+  // A native-messaging instance is different: the browser spawned it and it
+  // serves the extension over the stdio port, for which the WebSocket is
+  // optional. Exiting here would leave the extension with no daemon at all,
+  // so continue — degraded to stdio-only — exactly as before this change.
+  log(`ws server failed (port ${WS_PORT} in use?) — continuing over native messaging stdio: ${(err as Error).message}`)
 }
+
+try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH) } catch {}
+try {
+  if (IS_WIN) {
+    socketServer = Bun.listen({ hostname: "127.0.0.1", port: IPC_PORT, socket: socketHandlers })
+  } else {
+    socketServer = Bun.listen({ unix: SOCKET_PATH, socket: socketHandlers })
+  }
+  log(`socket listening on ${transportLabel()}`)
+} catch (err) {
+  log(`socket listen failed: ${(err as Error).message}`)
+  process.exit(1)
+}
+
+Bun.write(PID_PATH, `${process.pid}\n${transportLabel()}\n`)
+log(`pid file written: ${process.pid}`)
 
 function gracefulShutdown(signal: string) {
   log(`${signal} received, draining ${pendingRequests.size} pending requests`)

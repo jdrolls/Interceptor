@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, unlinkSync } from "node:fs"
-import { EVENTS_PATH, PID_PATH, SOCKET_PATH } from "../../shared/platform"
+import { EVENTS_PATH, PID_PATH, SOCKET_PATH, WS_PORT } from "../../shared/platform"
 import { sendCommand } from "../transport"
 
 export const TAB_ACCUMULATION_LIMIT = 8
@@ -9,6 +9,61 @@ export type ProbedTab = { managed?: boolean }
 
 export function countManagedTabs(tabs: ProbedTab[]): number {
   return tabs.filter(tab => tab.managed === true).length
+}
+
+/** The pid listening on the WebSocket port, or null when it cannot be found. */
+export async function findWsPortOwner(port = WS_PORT): Promise<number | null> {
+  try {
+    const proc = Bun.spawn(["lsof", "-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+    const output = await new Response(proc.stdout).text()
+    await proc.exited
+    const first = output.trim().split(/\s+/)[0]
+    const pid = Number.parseInt(first, 10)
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
+/** All process ids whose command line identifies an interceptor daemon. */
+export async function findDaemonPids(): Promise<number[]> {
+  try {
+    const proc = Bun.spawn(["pgrep", "-f", "interceptor-daemon"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+    const output = await new Response(proc.stdout).text()
+    await proc.exited
+    return [...new Set(output.split(/\s+/)
+      .map(value => Number.parseInt(value, 10))
+      .filter(pid => Number.isSafeInteger(pid) && pid > 0))]
+  } catch {
+    return []
+  }
+}
+
+export function detectSplitBrain(opts: {
+  daemonPid: number | null
+  wsOwnerPid: number | null
+  extensionOk: boolean
+  daemonPids: number[]
+}): { split: boolean; detail: string } {
+  const { daemonPid, wsOwnerPid, extensionOk, daemonPids } = opts
+  if (extensionOk || wsOwnerPid === null || wsOwnerPid === daemonPid) {
+    return { split: false, detail: "no daemon split-brain detected" }
+  }
+
+  // From the CLI daemon's perspective, every other daemon is an orphan. This
+  // includes the WS owner, which is serving the extension but not this socket.
+  const orphanCount = daemonPids.filter(pid => pid !== daemonPid).length
+  const cliOwner = daemonPid === null ? "missing pidfile daemon" : `pid ${daemonPid}`
+  return {
+    split: true,
+    detail: `extension is served by daemon pid ${wsOwnerPid} but the CLI socket is owned by ${cliOwner}; ${orphanCount} orphaned daemon(s)`,
+  }
 }
 
 /**
@@ -96,11 +151,32 @@ export async function waitForExtension(maxMs = 10_000, intervalMs = 500): Promis
   }
 }
 
-export function restartDaemon(): void {
-  const daemon = isDaemonAlive()
-  if (daemon.pid !== undefined) {
-    try { process.kill(daemon.pid, "SIGTERM") } catch { /* already gone */ }
+async function waitForPidsToExit(pids: number[], timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const anyAlive = pids.some(pid => {
+      try { process.kill(pid, 0); return true } catch { return false }
+    })
+    if (!anyAlive) return
+    await Bun.sleep(50)
   }
+}
+
+/** Reap every daemon identity before starting a replacement. */
+export async function restartDaemon(): Promise<void> {
+  const daemon = isDaemonAlive()
+  const wsOwner = await findWsPortOwner()
+  const daemonPids = await findDaemonPids()
+  const pids = [...new Set([
+    ...(daemon.pid === undefined ? [] : [daemon.pid]),
+    ...(wsOwner === null ? [] : [wsOwner]),
+    ...daemonPids,
+  ])]
+
+  for (const pid of pids) {
+    try { process.kill(pid, "SIGTERM") } catch { /* already gone or inaccessible */ }
+  }
+  await waitForPidsToExit(pids)
   try { unlinkSync(SOCKET_PATH) } catch { /* fine */ }
   try { unlinkSync(PID_PATH) } catch { /* fine */ }
 }

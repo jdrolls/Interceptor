@@ -1,13 +1,14 @@
 import { sendToHost, activeTransport, connectToHost, connectWsChannel } from "./transport"
 import { isTabInInterceptorGroup, interceptorGroupId, ensureInterceptorGroup, SENSITIVE_ACTIONS, verifyTabUrl } from "./tab-group"
 import { routeAction } from "./router"
-import { applyTabProvenance, type TabResolvedVia } from "./tab-provenance"
+import { applyTabProvenance, resolveTabFallback, type TabResolvedVia } from "./tab-provenance"
 
 export const MESSAGE_QUEUE_CAP = 50
 export const messageQueue: Array<{
   id?: string
   action?: { type: string; [key: string]: unknown }
   tabId?: number
+  allowTabDrift?: boolean
 }> = []
 
 const EXT_REQUEST_TIMEOUT_MS = 180_000
@@ -42,6 +43,7 @@ export async function handleDaemonMessage(msg: {
   id?: string
   action?: { type: string; [key: string]: unknown }
   tabId?: number
+  allowTabDrift?: boolean
 }): Promise<void> {
   if (!msg.action || !msg.id) return
 
@@ -94,17 +96,18 @@ export async function handleDaemonMessage(msg: {
   let tabResolvedVia: TabResolvedVia | undefined =
     tabId !== undefined ? "explicit" : undefined
 
+  let staleStoredTabId: number | undefined
   if (!tabId && needsTab(action.type)) {
     const stored = await chrome.storage.session.get("activeTabId") as { activeTabId?: number }
     if (stored.activeTabId !== undefined) {
       // Validate the stored tab is still live before trusting it — a stale id
-      // (tab closed) would otherwise silently route to the wrong place. If it's
-      // gone, clear it and fall through to the active-tab query.
+      // (tab closed) must not silently route an action to a different tab.
       try {
         await chrome.tabs.get(stored.activeTabId)
         tabId = stored.activeTabId
         tabResolvedVia = "stored"
       } catch {
+        staleStoredTabId = stored.activeTabId
         try { await chrome.storage.session.remove("activeTabId") } catch {}
       }
     }
@@ -112,18 +115,28 @@ export async function handleDaemonMessage(msg: {
 
   if (!tabId && needsTab(action.type)) {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true })
-    tabId = activeTab?.id
-    if (tabId) {
-      tabResolvedVia = "active-drift"
-      chrome.storage.session.set({ activeTabId: tabId })
+    const fallback = resolveTabFallback({
+      activeTab,
+      staleStoredTabId,
+      allowTabDrift: msg.allowTabDrift
+    })
+    if (!fallback.success) {
+      clearTimeout(requestTimer)
+      pendingRequests.delete(msg.id)
+      sendToHost({
+        id: msg.id,
+        result: {
+          success: false,
+          error: fallback.error || "no active tab",
+          ...(fallback.tabId !== undefined && { tabId: fallback.tabId }),
+          ...(fallback.tabResolvedVia !== undefined && { tabResolvedVia: fallback.tabResolvedVia })
+        }
+      }, respondViaWs)
+      return
     }
-  }
-
-  if (!tabId && needsTab(action.type)) {
-    clearTimeout(requestTimer)
-    pendingRequests.delete(msg.id)
-    sendToHost({ id: msg.id, result: { success: false, error: "no active tab" } }, respondViaWs)
-    return
+    tabId = fallback.tabId
+    tabResolvedVia = fallback.tabResolvedVia
+    chrome.storage.session.set({ activeTabId: tabId })
   }
 
   if (tabId) chrome.storage.session.set({ activeTabId: tabId })

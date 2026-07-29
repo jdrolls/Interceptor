@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { detectRecentTimeouts } from "../cli/commands/doctor"
-import { countManagedTabs } from "../cli/lib/daemon-health"
+import { countManagedTabs, detectSplitBrain } from "../cli/lib/daemon-health"
 import { deriveStageBudget } from "../extension/src/background/capabilities/screenshot-budget"
 
 describe("doctor: detectRecentTimeouts", () => {
@@ -50,6 +50,49 @@ describe("doctor: detectRecentTimeouts", () => {
       Array.from({ length: n }, (_, i) => ({ timestamp: iso(NOW - i * 1_000), error: "timeout" }))
     expect(detectRecentTimeouts(mk(2), NOW).degraded).toBe(false)
     expect(detectRecentTimeouts(mk(3), NOW).degraded).toBe(true)
+  })
+})
+
+describe("doctor: detectSplitBrain", () => {
+  test("detects a disconnected extension served by a different WS daemon and reports orphans", () => {
+    const result = detectSplitBrain({
+      daemonPid: 101,
+      wsOwnerPid: 202,
+      extensionOk: false,
+      daemonPids: [101, 202, 303]
+    })
+
+    expect(result.split).toBe(true)
+    expect(result.detail).toContain("daemon pid 202")
+    expect(result.detail).toContain("pid 101")
+    expect(result.detail).toContain("2 orphaned daemon(s)")
+  })
+
+  test("does not report split-brain when the extension is healthy", () => {
+    expect(detectSplitBrain({
+      daemonPid: 101,
+      wsOwnerPid: 202,
+      extensionOk: true,
+      daemonPids: [101, 202]
+    }).split).toBe(false)
+  })
+
+  test("does not report split-brain when the WS owner is the CLI daemon", () => {
+    expect(detectSplitBrain({
+      daemonPid: 101,
+      wsOwnerPid: 101,
+      extensionOk: false,
+      daemonPids: [101]
+    }).split).toBe(false)
+  })
+
+  test("does not report split-brain without a WS owner", () => {
+    expect(detectSplitBrain({
+      daemonPid: 101,
+      wsOwnerPid: null,
+      extensionOk: false,
+      daemonPids: [101]
+    }).split).toBe(false)
   })
 })
 
