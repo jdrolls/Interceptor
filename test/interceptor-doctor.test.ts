@@ -31,6 +31,32 @@ describe("doctor: detectRecentTimeouts", () => {
     expect(detectRecentTimeouts(events, NOW)).toEqual({ degraded: false, count: 2 })
   })
 
+  test("counts request_abandoned alongside request_timeout inside the 60s window", () => {
+    const events = [
+      { timestamp: iso(NOW - 1_000), event: "request_abandoned" },
+      { timestamp: iso(NOW - 2_000), event: "request_timeout" },
+      { timestamp: iso(NOW - 90_000), event: "request_abandoned" },
+    ]
+    expect(detectRecentTimeouts(events, NOW)).toEqual({ degraded: false, count: 2 })
+  })
+
+  test("deduplicates timeout events with the same request id", () => {
+    const events = [
+      { timestamp: iso(NOW - 1_000), event: "request_abandoned", requestId: "same" },
+      { timestamp: iso(NOW - 1_000), event: "request_timeout", requestId: "same" },
+    ]
+    expect(detectRecentTimeouts(events, NOW)).toEqual({ degraded: false, count: 1 })
+  })
+
+  test("counts distinct request ids and id-less timeout events independently", () => {
+    const events = [
+      { timestamp: iso(NOW - 1_000), event: "request_abandoned", requestId: "one" },
+      { timestamp: iso(NOW - 2_000), event: "request_timeout", requestId: "two" },
+      { timestamp: iso(NOW - 3_000), event: "request_timeout" },
+    ]
+    expect(detectRecentTimeouts(events, NOW)).toEqual({ degraded: true, count: 3 })
+  })
+
   test("timeout matching is case-insensitive", () => {
     const events = [{ timestamp: iso(NOW - 500), error: "TIMEOUT firing" }]
     expect(detectRecentTimeouts(events, NOW).count).toBe(1)

@@ -22,9 +22,9 @@ export type DaemonResponse = {
   result: DaemonResult
 }
 
-function recordTimeout(action: Action, error: string): void {
+function recordTimeout(action: Action, requestId: string, error: string): void {
   try {
-    appendFile(EVENTS_PATH, JSON.stringify({ timestamp: new Date().toISOString(), event: "request_timeout", action: action.type, error }) + "\n", () => {})
+    appendFile(EVENTS_PATH, JSON.stringify({ timestamp: new Date().toISOString(), event: "request_timeout", requestId, action: action.type, error }) + "\n", () => {})
   } catch {}
 }
 
@@ -47,7 +47,7 @@ export function sendCommand(action: Action, tabId?: number): Promise<DaemonRespo
         resolved = true
         if (socketRef) try { socketRef.end() } catch {}
         const error = `timeout: no response for '${action.type}' after ${INTERCEPTOR_TIMEOUT_MS / 1000}s. Ensure Chrome/Brave is open with the Interceptor extension loaded.`
-        recordTimeout(action, error)
+        recordTimeout(action, id, error)
         reject(new Error(error))
       }
     }, INTERCEPTOR_TIMEOUT_MS)
@@ -111,7 +111,7 @@ export function sendCommandWs(action: Action, tabId?: number): Promise<DaemonRes
 
     const timer = setTimeout(() => {
       const error = `timeout: no response for '${action.type}' after ${INTERCEPTOR_TIMEOUT_MS / 1000}s via WebSocket.`
-      recordTimeout(action, error)
+      recordTimeout(action, id, error)
       reject(new Error(error))
     }, INTERCEPTOR_TIMEOUT_MS)
 

@@ -4,7 +4,7 @@ import { sendCommand } from "../transport"
 
 export const TAB_ACCUMULATION_LIMIT = 8
 
-export type DoctorEvent = { timestamp?: string; error?: string; event?: string }
+export type DoctorEvent = { timestamp?: string; error?: string; event?: string; requestId?: string }
 export type ProbedTab = { managed?: boolean }
 
 export function countManagedTabs(tabs: ProbedTab[]): number {
@@ -78,17 +78,43 @@ export function detectRecentTimeouts(
   threshold = 3
 ): { degraded: boolean; count: number } {
   let count = 0
+  const requestIds = new Set<string>()
   for (const ev of events) {
     if (!ev) continue
-    const isTimeout = (typeof ev.error === "string" && ev.error.toLowerCase().includes("timeout")) || ev.event === "request_timeout"
+    const isTimeout = (typeof ev.error === "string" && ev.error.toLowerCase().includes("timeout")) || ev.event === "request_timeout" || ev.event === "request_abandoned"
     if (!isTimeout) continue
     if (ev.timestamp) {
       const t = new Date(ev.timestamp).getTime()
       if (!Number.isNaN(t) && t < now - windowMs) continue
     }
+    if (ev.requestId) {
+      if (requestIds.has(ev.requestId)) continue
+      requestIds.add(ev.requestId)
+    }
     count++
   }
   return { degraded: count >= threshold, count }
+}
+
+export async function getDaemonStatus(): Promise<{ extensionConnected: boolean } | null> {
+  try {
+    // Bound this the way probeExtension is. `daemon_status` is answered by the daemon
+    // itself, so a healthy one replies immediately — but an OLDER daemon that predates
+    // the action forwards it to the extension instead, where it would hang for the full
+    // CLI ceiling and log a spurious timeout. During a CLI/daemon version skew the
+    // preflight must stay fast and must not pollute the degradation detector.
+    const resp = await Promise.race([
+      sendCommand({ type: "daemon_status" }, undefined),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("daemon_status timed out after 2s")), 2000)
+      ),
+    ])
+    if (!resp.result.success || !resp.result.data || typeof resp.result.data !== "object") return null
+    const { extensionConnected } = resp.result.data as { extensionConnected?: unknown }
+    return typeof extensionConnected === "boolean" ? { extensionConnected } : null
+  } catch {
+    return null
+  }
 }
 
 export function isDaemonAlive(): { alive: boolean; pid?: number } {

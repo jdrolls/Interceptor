@@ -12,6 +12,12 @@ import {
   updateSessionMeta,
 } from "../shared/monitor-artifacts"
 import { chooseOutboundTransport } from "./outbound-routing"
+import {
+  abandonSocketRequests,
+  shouldDrainQueuedMessage,
+  WS_QUEUE_MAX_AGE_MS,
+  type WsQueuedMessage,
+} from "./request-lifecycle"
 
 // ── Native Bridge (interceptor-bridge) connection ────────────────────────────────
 const BRIDGE_SOCKET_PATH = "/tmp/interceptor-bridge.sock"
@@ -427,6 +433,7 @@ const pendingRequests = new Map<string, {
   resolve: (v: string) => void
   timer: ReturnType<typeof setTimeout>
   socket: { write: (data: Buffer | string) => number; readonly remoteAddress: string }
+  owner: object
   startTime: number
   actionType: string
 }>()
@@ -611,15 +618,31 @@ function handleNativeMessage(msg: { id?: string; type?: string; [key: string]: u
 
 let extensionWs: { send: (data: string) => void } | null = null
 let nativeRelaySocket: Bun.Socket<undefined> | null = null
-const wsOutboundQueue: string[] = []
+const wsOutboundQueue: WsQueuedMessage[] = []
 const WS_QUEUE_CAP = 50
+
+function removeQueuedRequest(requestId: string): void {
+  for (let i = wsOutboundQueue.length - 1; i >= 0; i--) {
+    if (wsOutboundQueue[i].id === requestId) wsOutboundQueue.splice(i, 1)
+  }
+}
 
 function drainWsOutboundQueue(): void {
   if (!extensionWs) return
   while (wsOutboundQueue.length > 0) {
-    const msg = wsOutboundQueue.shift()!
-    log(`draining queued ws message: ${msg.slice(0, 100)}`)
-    try { extensionWs.send(msg) } catch (err) { log(`ws drain error: ${(err as Error).message}`) }
+    const entry = wsOutboundQueue.shift()!
+    const decision = shouldDrainQueuedMessage(entry, {
+      now: Date.now(),
+      isPending: id => pendingRequests.has(id),
+      maxAgeMs: WS_QUEUE_MAX_AGE_MS,
+    })
+    if (!decision.drain) {
+      // A reconnect must never turn an expired caller's work into a live action.
+      log(`skipping queued ws message (${decision.reason}): ${entry.json.slice(0, 100)}`)
+      continue
+    }
+    log(`draining queued ws message: ${entry.json.slice(0, 100)}`)
+    try { extensionWs.send(entry.json) } catch (err) { log(`ws drain error: ${(err as Error).message}`) }
   }
 }
 
@@ -711,7 +734,8 @@ function sendNativeMessage(msg: unknown): void {
   }
 
   if (wsOutboundQueue.length >= WS_QUEUE_CAP) wsOutboundQueue.shift()
-  wsOutboundQueue.push(json)
+  const id = (msg as { id?: unknown } | null)?.id
+  wsOutboundQueue.push({ id: typeof id === "string" ? id : undefined, json, queuedAt: Date.now() })
   log(`queued for ws (${wsOutboundQueue.length} pending): ${json.slice(0, 100)}`)
 }
 
@@ -854,6 +878,14 @@ try {
           log(`cli request: ${id} ${JSON.stringify(request.action).slice(0, 100)}`)
           emitEvent("request_received", { requestId: id, action: actionType })
 
+          if (action?.type === "daemon_status") {
+            socketWriteFramed(socket, JSON.stringify({
+              id,
+              result: { success: true, data: { extensionConnected: !!extensionWs } }
+            }))
+            continue
+          }
+
           if (action?.type?.startsWith("os_") && action.windowBounds && action.pageX !== undefined) {
             handleOsAction(id, action).then((osResult) => {
               if (osResult) {
@@ -900,6 +932,7 @@ try {
             },
             timer,
             socket,
+            owner: socket,
             startTime: Date.now(),
             actionType
           })
@@ -913,6 +946,12 @@ try {
         drainSocketQueue(socket)
       },
       close(socket: Bun.Socket<undefined>) {
+        abandonSocketRequests(pendingRequests, socket, {
+          now: Date.now(),
+          clearTimer: clearTimeout,
+          removeQueuedRequest,
+          onAbandoned: event => emitEvent("request_abandoned", event),
+        })
         if ((socket as any).__nativeRelay) {
           nativeRelaySocket = null
           log("native relay disconnected")
@@ -921,7 +960,13 @@ try {
         socketWriteQueues.delete(socket)
         log("cli disconnected")
       },
-      error(_socket: Bun.Socket<undefined>, err: Error) {
+      error(socket: Bun.Socket<undefined>, err: Error) {
+        abandonSocketRequests(pendingRequests, socket, {
+          now: Date.now(),
+          clearTimer: clearTimeout,
+          removeQueuedRequest,
+          onAbandoned: event => emitEvent("request_abandoned", event),
+        })
         log(`socket error: ${err.message}`)
       }
     }
@@ -1000,6 +1045,7 @@ try {
           },
           timer,
           socket: { write: () => 0, remoteAddress: "ws" } as any,
+          owner: ws,
           startTime: Date.now(),
           actionType
         })
@@ -1007,7 +1053,16 @@ try {
         sendNativeMessage({ id, action: request.action, tabId: request.tabId, allowTabDrift: request.allowTabDrift })
       },
       close(ws) {
-        if ((ws as any).__isExtension) extensionWs = null
+        if ((ws as any).__isExtension) {
+          extensionWs = null
+        } else {
+          abandonSocketRequests(pendingRequests, ws, {
+            now: Date.now(),
+            clearTimer: clearTimeout,
+            removeQueuedRequest,
+            onAbandoned: event => emitEvent("request_abandoned", event),
+          })
+        }
         log("ws client disconnected")
       }
     }

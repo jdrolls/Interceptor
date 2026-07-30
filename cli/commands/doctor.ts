@@ -17,6 +17,7 @@ import {
   detectSplitBrain,
   findDaemonPids,
   findWsPortOwner,
+  getDaemonStatus,
   isDaemonAlive,
   probeExtension,
   readEvents,
@@ -46,8 +47,17 @@ async function runChecks(): Promise<Check[]> {
 
   // Extension + tab checks only make sense when the daemon is up.
   if (daemon.alive) {
+    const daemonStatus = await getDaemonStatus()
     const probe = await probeExtension()
-    checks.push({ name: "extension", ok: probe.ok, detail: probe.detail })
+    const detail = !probe.ok && daemonStatus?.extensionConnected === false
+      ? "no browser with the Interceptor extension is connected — open your browser (or run 'interceptor reload'); restarting the daemon will not help"
+      // Match on "timed out" rather than probeExtension's exact message: a probe that
+      // failed for a *specific* reason (e.g. "no tabs in interceptor group") already
+      // says something more useful than "wedged", and must keep its own wording.
+      : !probe.ok && daemonStatus?.extensionConnected === true && probe.detail.includes("timed out")
+        ? `extension channel is registered but ${probe.detail} — extension may be wedged or degraded`
+        : probe.detail
+    checks.push({ name: "extension", ok: probe.ok, detail })
     if (!probe.ok) {
       const splitBrain = detectSplitBrain({
         daemonPid: daemon.pid ?? null,
