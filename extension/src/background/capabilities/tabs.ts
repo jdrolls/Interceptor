@@ -1,5 +1,6 @@
 import { addTabToInterceptorGroup, ensureInterceptorGroup, interceptorGroupId } from "../tab-group"
 import { waitForTabLoad } from "../content-bridge"
+import { findReusableTab } from "../tab-reuse"
 
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
 
@@ -9,12 +10,25 @@ export async function handleTabActions(
 ): Promise<ActionResult> {
   switch (action.type) {
     case "tab_create": {
-      const newTab = await chrome.tabs.create({ url: (action.url as string) || "about:blank" })
+      const url = (action.url as string) || "about:blank"
+      if (!action.forceNew) {
+        try {
+          const tabs = await chrome.tabs.query({})
+          const groupId = await ensureInterceptorGroup()
+          const matchId = findReusableTab(tabs, url, groupId)
+          if (matchId !== undefined) {
+            await chrome.tabs.update(matchId, { active: true })
+            return { success: true, data: { tabId: matchId, url, groupId, reused: true } }
+          }
+        } catch {}
+      }
+
+      const newTab = await chrome.tabs.create({ url })
       if (newTab.id) {
         const groupId = await addTabToInterceptorGroup(newTab.id)
-        return { success: true, data: { tabId: newTab.id, url: newTab.url, groupId } }
+        return { success: true, data: { tabId: newTab.id, url: newTab.url, groupId, reused: false } }
       }
-      return { success: true, data: { tabId: newTab.id, url: newTab.url } }
+      return { success: true, data: { tabId: newTab.id, url: newTab.url, reused: false } }
     }
 
     case "tab_close":

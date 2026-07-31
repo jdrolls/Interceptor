@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { buildReadTreeAction } from "../cli/commands/compound"
+import { buildReadTreeAction, readRoutingFrom } from "../cli/commands/compound"
 import { parseElementTarget } from "../cli/parse"
 
 describe("buildReadTreeAction", () => {
@@ -35,6 +35,35 @@ describe("buildReadTreeAction", () => {
       ref: "e2",
       includeStyle: false,
       filter: "interactive"
+    })
+  })
+})
+
+describe("readRoutingFrom", () => {
+  test("uses routing metadata from the successful underlying read action", () => {
+    expect(readRoutingFrom(
+      {
+        success: true,
+        tabId: 42,
+        tabResolvedVia: "stored",
+        resolvedTabUrl: "https://example.com/stored"
+      },
+      { success: true, tabId: 42, tabResolvedVia: "stored", resolvedTabUrl: "https://example.com/stored" }
+    )).toEqual({
+      tabId: 42,
+      tabResolvedVia: "stored",
+      resolvedTabUrl: "https://example.com/stored"
+    })
+  })
+
+  test("falls back to the text result when the tree read failed", () => {
+    expect(readRoutingFrom(
+      { success: false, error: "tree unavailable" },
+      { success: true, tabId: 43, tabResolvedVia: "active-drift", resolvedTabUrl: "https://example.com/active" }
+    )).toEqual({
+      tabId: 43,
+      tabResolvedVia: "active-drift",
+      resolvedTabUrl: "https://example.com/active"
     })
   })
 })

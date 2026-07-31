@@ -1,3 +1,4 @@
+import type { TabResolvedVia } from "../../../shared/tab-provenance"
 import { sendToContentScript } from "./content-bridge"
 import { activeTransport } from "./transport"
 import { handleOsInputActions } from "./capabilities/os-input"
@@ -26,7 +27,14 @@ import { handleMonitorActions, registerMonitorListeners } from "./capabilities/m
 
 registerMonitorListeners()
 
-type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
+export type ActionResult = {
+  success: boolean
+  error?: string
+  data?: unknown
+  tabId?: number
+  tabResolvedVia?: TabResolvedVia
+  resolvedTabUrl?: string
+}
 
 const OS_INPUT_ACTIONS = new Set(["os_click", "os_key", "os_type", "os_move"])
 const SCREENSHOT_ACTIONS = new Set(["screenshot", "screenshot_background", "page_capture"])

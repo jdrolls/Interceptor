@@ -33,6 +33,7 @@ Compound (agent-optimized):
   interceptor open <url> --full              Full text instead of 2000-char summary
   interceptor open <url> --timeout <ms>      Override wait-stable timeout (default 5000)
   interceptor open <url> --no-wait           Return immediately after tab creation
+  interceptor open <url> --new               Always create a fresh tab
   interceptor read                           Tree + text for active tab
   interceptor read <ref>                     Tree + text for element subtree
   interceptor read --tree-only               Skip text
@@ -214,4 +215,5 @@ Recording (Session Monitor):
 
 Meta:
   interceptor status                         Check daemon status (local — no connection needed)
+  interceptor doctor [--json] [--fix]        Health preflight; --fix restarts a degraded daemon
   interceptor help                           This help text`

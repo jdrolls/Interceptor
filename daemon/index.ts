@@ -12,6 +12,12 @@ import {
   updateSessionMeta,
 } from "../shared/monitor-artifacts"
 import { chooseOutboundTransport } from "./outbound-routing"
+import {
+  abandonSocketRequests,
+  shouldDrainQueuedMessage,
+  WS_QUEUE_MAX_AGE_MS,
+  type WsQueuedMessage,
+} from "./request-lifecycle"
 
 // ── Native Bridge (interceptor-bridge) connection ────────────────────────────────
 const BRIDGE_SOCKET_PATH = "/tmp/interceptor-bridge.sock"
@@ -420,12 +426,14 @@ if (existsSync(PID_PATH)) {
   } catch {}
 }
 
-try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH) } catch {}
+// Do not touch the CLI socket until we have claimed the authoritative WS port.
+// A stale pidfile must never cause this process to unlink a live daemon socket.
 
 const pendingRequests = new Map<string, {
   resolve: (v: string) => void
   timer: ReturnType<typeof setTimeout>
   socket: { write: (data: Buffer | string) => number; readonly remoteAddress: string }
+  owner: object
   startTime: number
   actionType: string
 }>()
@@ -610,15 +618,31 @@ function handleNativeMessage(msg: { id?: string; type?: string; [key: string]: u
 
 let extensionWs: { send: (data: string) => void } | null = null
 let nativeRelaySocket: Bun.Socket<undefined> | null = null
-const wsOutboundQueue: string[] = []
+const wsOutboundQueue: WsQueuedMessage[] = []
 const WS_QUEUE_CAP = 50
+
+function removeQueuedRequest(requestId: string): void {
+  for (let i = wsOutboundQueue.length - 1; i >= 0; i--) {
+    if (wsOutboundQueue[i].id === requestId) wsOutboundQueue.splice(i, 1)
+  }
+}
 
 function drainWsOutboundQueue(): void {
   if (!extensionWs) return
   while (wsOutboundQueue.length > 0) {
-    const msg = wsOutboundQueue.shift()!
-    log(`draining queued ws message: ${msg.slice(0, 100)}`)
-    try { extensionWs.send(msg) } catch (err) { log(`ws drain error: ${(err as Error).message}`) }
+    const entry = wsOutboundQueue.shift()!
+    const decision = shouldDrainQueuedMessage(entry, {
+      now: Date.now(),
+      isPending: id => pendingRequests.has(id),
+      maxAgeMs: WS_QUEUE_MAX_AGE_MS,
+    })
+    if (!decision.drain) {
+      // A reconnect must never turn an expired caller's work into a live action.
+      log(`skipping queued ws message (${decision.reason}): ${entry.json.slice(0, 100)}`)
+      continue
+    }
+    log(`draining queued ws message: ${entry.json.slice(0, 100)}`)
+    try { extensionWs.send(entry.json) } catch (err) { log(`ws drain error: ${(err as Error).message}`) }
   }
 }
 
@@ -710,7 +734,8 @@ function sendNativeMessage(msg: unknown): void {
   }
 
   if (wsOutboundQueue.length >= WS_QUEUE_CAP) wsOutboundQueue.shift()
-  wsOutboundQueue.push(json)
+  const id = (msg as { id?: unknown } | null)?.id
+  wsOutboundQueue.push({ id: typeof id === "string" ? id : undefined, json, queuedAt: Date.now() })
   log(`queued for ws (${wsOutboundQueue.length} pending): ${json.slice(0, 100)}`)
 }
 
@@ -802,9 +827,10 @@ async function handleOsAction(
 }
 
 let socketServer: Bun.TCPSocketListener<undefined> | Bun.UnixSocketListener<undefined> | null = null
+let socketHandlers: Bun.SocketHandler<undefined>
 
 try {
-  const socketHandlers: Bun.SocketHandler<undefined> = {
+  socketHandlers = {
       open(socket: Bun.Socket<undefined>) {
         socketBuffers.set(socket, Buffer.alloc(0))
         log("cli connected via socket")
@@ -824,7 +850,7 @@ try {
           const jsonBuf = buf.subarray(4, 4 + msgLen)
           buf = buf.subarray(4 + msgLen)
 
-          let request: { id?: string; action?: unknown; tabId?: number; type?: string }
+          let request: { id?: string; action?: unknown; tabId?: number; allowTabDrift?: boolean; type?: string }
           try {
             request = JSON.parse(jsonBuf.toString("utf-8"))
           } catch {
@@ -851,6 +877,14 @@ try {
           const actionType = action?.type || "unknown"
           log(`cli request: ${id} ${JSON.stringify(request.action).slice(0, 100)}`)
           emitEvent("request_received", { requestId: id, action: actionType })
+
+          if (action?.type === "daemon_status") {
+            socketWriteFramed(socket, JSON.stringify({
+              id,
+              result: { success: true, data: { extensionConnected: !!extensionWs } }
+            }))
+            continue
+          }
 
           if (action?.type?.startsWith("os_") && action.windowBounds && action.pageX !== undefined) {
             handleOsAction(id, action).then((osResult) => {
@@ -881,11 +915,14 @@ try {
           }
 
           const timer = setTimeout(() => {
+            const pending = pendingRequests.get(id)
             pendingRequests.delete(id)
             timedOutRequests.add(id)
             setTimeout(() => timedOutRequests.delete(id), 60_000)
+            const duration = pending ? Date.now() - pending.startTime : REQUEST_TIMEOUT_MS
+            const error = `timeout: no response for '${actionType}' after ${duration}ms`
             log(`request timeout: ${id}`)
-            emitEvent("request_timeout", { requestId: id, action: actionType })
+            emitEvent("request_timeout", { requestId: id, action: actionType, duration, error })
             socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: "timeout" } }))
           }, REQUEST_TIMEOUT_MS)
           pendingRequests.set(id, {
@@ -895,11 +932,12 @@ try {
             },
             timer,
             socket,
+            owner: socket,
             startTime: Date.now(),
             actionType
           })
 
-          sendNativeMessage({ id, action: request.action, tabId: request.tabId })
+          sendNativeMessage({ id, action: request.action, tabId: request.tabId, allowTabDrift: request.allowTabDrift })
         }
 
         socketBuffers.set(socket, buf)
@@ -908,6 +946,12 @@ try {
         drainSocketQueue(socket)
       },
       close(socket: Bun.Socket<undefined>) {
+        abandonSocketRequests(pendingRequests, socket, {
+          now: Date.now(),
+          clearTimer: clearTimeout,
+          removeQueuedRequest,
+          onAbandoned: event => emitEvent("request_abandoned", event),
+        })
         if ((socket as any).__nativeRelay) {
           nativeRelaySocket = null
           log("native relay disconnected")
@@ -916,23 +960,20 @@ try {
         socketWriteQueues.delete(socket)
         log("cli disconnected")
       },
-      error(_socket: Bun.Socket<undefined>, err: Error) {
+      error(socket: Bun.Socket<undefined>, err: Error) {
+        abandonSocketRequests(pendingRequests, socket, {
+          now: Date.now(),
+          clearTimer: clearTimeout,
+          removeQueuedRequest,
+          onAbandoned: event => emitEvent("request_abandoned", event),
+        })
         log(`socket error: ${err.message}`)
       }
     }
-  if (IS_WIN) {
-    socketServer = Bun.listen({ hostname: "127.0.0.1", port: IPC_PORT, socket: socketHandlers })
-  } else {
-    socketServer = Bun.listen({ unix: SOCKET_PATH, socket: socketHandlers })
-  }
-  log(`socket listening on ${transportLabel()}`)
 } catch (err) {
-  log(`socket listen failed: ${(err as Error).message}`)
+  log(`socket handler setup failed: ${(err as Error).message}`)
   process.exit(1)
 }
-
-Bun.write(PID_PATH, `${process.pid}\n${transportLabel()}\n`)
-log(`pid file written: ${process.pid}`)
 
 let wsServer: ReturnType<typeof Bun.serve> | null = null
 try {
@@ -949,7 +990,7 @@ try {
       message(ws, raw) {
         const rawStr = typeof raw === "string" ? raw : Buffer.from(raw).toString("utf-8")
         log(`ws recv: ${rawStr.slice(0, 300)}`)
-        let request: { id?: string; action?: unknown; tabId?: number; type?: string; result?: unknown }
+        let request: { id?: string; action?: unknown; tabId?: number; allowTabDrift?: boolean; type?: string; result?: unknown }
         try {
           request = JSON.parse(rawStr)
         } catch {
@@ -986,10 +1027,14 @@ try {
 
         const actionType = (request.action as { type?: string })?.type || "unknown"
         const timer = setTimeout(() => {
+          const pending = pendingRequests.get(id)
           pendingRequests.delete(id)
           timedOutRequests.add(id)
           setTimeout(() => timedOutRequests.delete(id), 60_000)
+          const duration = pending ? Date.now() - pending.startTime : REQUEST_TIMEOUT_MS
+          const error = `timeout: no response for '${actionType}' after ${duration}ms`
           log(`ws request timeout: ${id}`)
+          emitEvent("request_timeout", { requestId: id, action: actionType, duration, error })
           ws.send(JSON.stringify({ id, result: { success: false, error: "timeout" } }))
         }, REQUEST_TIMEOUT_MS)
 
@@ -1000,27 +1045,68 @@ try {
           },
           timer,
           socket: { write: () => 0, remoteAddress: "ws" } as any,
+          owner: ws,
           startTime: Date.now(),
           actionType
         })
 
-        sendNativeMessage({ id, action: request.action, tabId: request.tabId })
+        sendNativeMessage({ id, action: request.action, tabId: request.tabId, allowTabDrift: request.allowTabDrift })
       },
       close(ws) {
-        if ((ws as any).__isExtension) extensionWs = null
+        if ((ws as any).__isExtension) {
+          extensionWs = null
+        } else {
+          abandonSocketRequests(pendingRequests, ws, {
+            now: Date.now(),
+            clearTimer: clearTimeout,
+            removeQueuedRequest,
+            onAbandoned: event => emitEvent("request_abandoned", event),
+          })
+        }
         log("ws client disconnected")
       }
     }
   })
   log(`ws server listening on port ${WS_PORT}`)
 } catch (err) {
-  log(`ws server failed (port ${WS_PORT} in use?) — continuing without WebSocket: ${(err as Error).message}`)
+  // A STANDALONE daemon reaches the extension only over this WebSocket. Losing
+  // the bind while still claiming the CLI socket is precisely the split brain
+  // (dora-cc#880): the CLI talks here, the extension talks to the port owner,
+  // and every request times out. Refuse to exist instead.
+  if (STANDALONE) {
+    log(`another daemon already owns ws port ${WS_PORT} — exiting (extension is served by it): ${(err as Error).message}`)
+    process.exit(0)
+  }
+  // A native-messaging instance is different: the browser spawned it and it
+  // serves the extension over the stdio port, for which the WebSocket is
+  // optional. Exiting here would leave the extension with no daemon at all,
+  // so continue — degraded to stdio-only — exactly as before this change.
+  log(`ws server failed (port ${WS_PORT} in use?) — continuing over native messaging stdio: ${(err as Error).message}`)
 }
+
+try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH) } catch {}
+try {
+  if (IS_WIN) {
+    socketServer = Bun.listen({ hostname: "127.0.0.1", port: IPC_PORT, socket: socketHandlers })
+  } else {
+    socketServer = Bun.listen({ unix: SOCKET_PATH, socket: socketHandlers })
+  }
+  log(`socket listening on ${transportLabel()}`)
+} catch (err) {
+  log(`socket listen failed: ${(err as Error).message}`)
+  process.exit(1)
+}
+
+Bun.write(PID_PATH, `${process.pid}\n${transportLabel()}\n`)
+log(`pid file written: ${process.pid}`)
 
 function gracefulShutdown(signal: string) {
   log(`${signal} received, draining ${pendingRequests.size} pending requests`)
   for (const [id, req] of pendingRequests) {
     clearTimeout(req.timer)
+    const duration = Date.now() - req.startTime
+    const error = `timeout: daemon shut down before '${req.actionType}' completed after ${duration}ms`
+    emitEvent("request_timeout", { requestId: id, action: req.actionType, duration, error })
     socketWriteFramed(req.socket, JSON.stringify({ id, result: { success: false, error: "daemon shutting down" } }))
   }
   pendingRequests.clear()

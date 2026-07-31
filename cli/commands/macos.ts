@@ -6,7 +6,8 @@
  */
 
 import { existsSync } from "node:fs"
-import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
+import { type DaemonResponse } from "../transport"
+import { sendWithRecovery } from "../lib/self-heal"
 
 type Action = { type: string; [key: string]: unknown }
 type Result = { success: boolean; error?: string; data?: unknown }
@@ -21,9 +22,7 @@ async function send(
   useWs = false
 ): Promise<Result> {
   try {
-    const resp = useWs
-      ? await sendCommandWs(action, tabId)
-      : await sendCommand(action, tabId)
+    const resp = await sendWithRecovery(action, tabId, useWs)
     return unwrap(resp)
   } catch (err) {
     return { success: false, error: (err as Error).message }

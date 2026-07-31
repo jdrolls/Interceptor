@@ -1,21 +1,82 @@
 import { sendToContentScript } from "../content-bridge"
 import { sendToOffscreen } from "../offscreen"
 import { installScreenshotCorsRule, uninstallScreenshotCorsRule } from "./screenshot-cors"
+import { deriveStageBudget } from "./screenshot-budget"
 
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
 
 const CAPTURE_TIMEOUT_MS = 5000
 const DOM_RENDER_TIMEOUT_MS = 30_000
+const DOM_RENDER_ROUNDTRIP_TIMEOUT_MS = 8000
+// chrome.scripting.executeScript needs the page renderer's main thread, so it
+// can queue behind an abandoned html-to-image pass (observed at 32s/47s/63s).
+// Cap runner setup before it can consume the roundtrip and fallback budgets.
+const RUNNER_INJECT_TIMEOUT_MS = 3000
+// cli/transport.ts sets INTERCEPTOR_TIMEOUT_MS to 15_000ms. The shared 12s
+// deadline leaves 3s for daemon relay and dataURL encoding. The CORS-rule and
+// runner-injection awaits each cap at 3s; the roundtrip is <= min(8s, remaining
+// - 3.5s), and the pixel fallback is <= its remaining budget. The shared
+// absolute deadline keeps their serial sum within 12s rather than stacking
+// independent caps.
+export const SCREENSHOT_TOTAL_BUDGET_MS = 12_000
+const SCREENSHOT_STAGE_FLOOR_MS = 100
+const PIXEL_FALLBACK_RESERVE_MS = 3_500
+// tabCapture is a multi-step media pipeline; a smaller remainder would merely
+// create another timeout chain after captureVisibleTab has already failed.
+const TAB_CAPTURE_FALLBACK_MIN_BUDGET_MS = CAPTURE_TIMEOUT_MS
+
+type DomRenderResult = {
+  success: boolean
+  error?: string
+  data?: { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string }
+}
 const VISIBILITY_HINT = "Chrome/Brave window may not be visible — bring it to the front and retry, or pass --tab <id> of a tab in a visible window."
 
 class CaptureTimeoutError extends Error {
   readonly operation: string
   readonly timeoutMs: number
-  constructor(operation: string, timeoutMs: number) {
+  readonly budgetExhausted: boolean
+  constructor(operation: string, timeoutMs: number, budgetExhausted = false) {
     super(`${operation} timed out after ${timeoutMs}ms`)
     this.name = "CaptureTimeoutError"
     this.operation = operation
     this.timeoutMs = timeoutMs
+    this.budgetExhausted = budgetExhausted
+  }
+}
+
+function getStageTimeout(operation: string, deadline: number | undefined, reserve = 0, stageDefault = CAPTURE_TIMEOUT_MS): number {
+  if (deadline === undefined) return CAPTURE_TIMEOUT_MS
+  const stage = deriveStageBudget({
+    deadline,
+    now: Date.now(),
+    stageDefault,
+    reserve,
+    floor: SCREENSHOT_STAGE_FLOOR_MS
+  })
+  if (stage.budgetExhausted) throw new CaptureTimeoutError(operation, stage.timeoutMs, true)
+  return stage.timeoutMs
+}
+
+function withDeadlineTimeout<T>(operation: string, p: Promise<T>, deadline?: number, reserve = 0, stageDefault = CAPTURE_TIMEOUT_MS): Promise<T> {
+  return withCaptureTimeout(operation, p, getStageTimeout(operation, deadline, reserve, stageDefault))
+}
+
+// For stages that carried NO timeout before the deadline budget existed
+// (stitch, crop, rect, post-capture transform). Bounding them only matters when
+// a deadline is in play; without one, capping them at CAPTURE_TIMEOUT_MS would
+// be a NEW ceiling — and stitching a tall full-page capture legitimately runs
+// past 5s. Deadline absent => preserve the original unbounded behavior.
+function withOptionalDeadlineTimeout<T>(operation: string, p: Promise<T>, deadline?: number, reserve = 0, stageDefault = CAPTURE_TIMEOUT_MS): Promise<T> {
+  if (deadline === undefined) return p
+  return withDeadlineTimeout(operation, p, deadline, reserve, stageDefault)
+}
+
+function captureBudgetFailure(operation: string, timeoutMs: number): ActionResult {
+  return {
+    success: false,
+    error: `${operation} timed out after ${timeoutMs}ms (screenshot budget exhausted)`,
+    data: { layer: "captureVisibleTab", timedOutMs: timeoutMs, budgetExhausted: true }
   }
 }
 
@@ -130,10 +191,36 @@ async function reencodeAsWebP(dataUrl: string, qualityPct: number): Promise<stri
   }
 }
 
+async function fallbackToPixelAfterTimeout(
+  action: { type: string; [key: string]: unknown },
+  tabId: number,
+  deadline: number,
+  timeout: CaptureTimeoutError,
+  fallbackLabel: string,
+  errorOperation: string,
+  layer: string,
+  returnCaptureFailure = false
+): Promise<ActionResult> {
+  const fallback = await handlePixelScreenshot({ ...action, pixel: true }, tabId, deadline)
+  if (fallback.success && fallback.data && typeof fallback.data === "object") {
+    (fallback.data as Record<string, unknown>).fallback = fallbackLabel
+    return fallback
+  }
+  if (returnCaptureFailure && (fallback.data as { layer?: string } | undefined)?.layer === "captureVisibleTab") {
+    return fallback
+  }
+  return {
+    success: false,
+    error: `${errorOperation} timed out after ${timeout.timeoutMs}ms and captureVisibleTab fallback failed: ${fallback.error || "unknown error"}`,
+    data: { layer, timedOutMs: timeout.timeoutMs, budgetExhausted: true }
+  }
+}
+
 async function handleDomRenderScreenshot(
   action: { type: string; [key: string]: unknown },
   tabId: number
 ): Promise<ActionResult> {
+  const deadline = Date.now() + SCREENSHOT_TOTAL_BUDGET_MS
   const mode = resolveDomMode(action)
   const requestedFormat = (action.format as string) === "webp" ? "webp"
     : (action.format as string) === "jpeg" ? "jpeg"
@@ -156,10 +243,39 @@ async function handleDomRenderScreenshot(
     return { success: false, error: `tab ${tabId} not found` }
   }
 
-  await installScreenshotCorsRule(tabId)
   try {
-    const inject = await injectScreenshotRunner(tabId)
-    if (!inject.success) return { success: false, error: inject.error || "runner injection failed" }
+    await withDeadlineTimeout(
+      "installScreenshotCorsRule",
+      installScreenshotCorsRule(tabId),
+      deadline,
+      PIXEL_FALLBACK_RESERVE_MS,
+      RUNNER_INJECT_TIMEOUT_MS
+    )
+
+    let inject: { success: boolean; error?: string }
+    try {
+      inject = await withDeadlineTimeout(
+        "screenshot-runner injection",
+        injectScreenshotRunner(tabId),
+        deadline,
+        PIXEL_FALLBACK_RESERVE_MS,
+        RUNNER_INJECT_TIMEOUT_MS
+      )
+    } catch (err) {
+      if (err instanceof CaptureTimeoutError) {
+        return fallbackToPixelAfterTimeout(
+          action,
+          tabId,
+          deadline,
+          err,
+          "pixel (screenshot-runner injection timed out)",
+          "screenshot-runner injection",
+          "executeScript"
+        )
+      }
+      throw err
+    }
+    if (!inject.success) return { success: false, error: inject.error || "runner injection failed", data: { layer: "executeScript" } }
 
     const dsAction: { type: string; [key: string]: unknown } = { type: "dom_screenshot", mode, format: renderFormat, quality }
     if (action.ref !== undefined) dsAction.ref = action.ref
@@ -169,10 +285,49 @@ async function handleDomRenderScreenshot(
     if (scale !== undefined) dsAction.scale = scale
     if (targetMaxLongEdge !== undefined) dsAction.target_max_long_edge = targetMaxLongEdge
 
-    const renderResult = await sendToContentScript(tabId, dsAction) as { success: boolean; error?: string; data?: { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string } }
+    let renderResult: DomRenderResult
+    try {
+      const roundtrip = deriveStageBudget({
+        deadline,
+        now: Date.now(),
+        stageDefault: DOM_RENDER_ROUNDTRIP_TIMEOUT_MS,
+        reserve: PIXEL_FALLBACK_RESERVE_MS,
+        floor: SCREENSHOT_STAGE_FLOOR_MS
+      })
+      if (roundtrip.budgetExhausted) {
+        return {
+          success: false,
+          error: `domRenderRoundtrip timed out after ${roundtrip.timeoutMs}ms (screenshot budget exhausted)`,
+          data: { layer: "domRenderRoundtrip", timedOutMs: roundtrip.timeoutMs, budgetExhausted: true }
+        }
+      }
+      renderResult = await withCaptureTimeout(
+        "domRenderRoundtrip",
+        sendToContentScript(tabId, dsAction) as Promise<DomRenderResult>,
+        roundtrip.timeoutMs
+      )
+    } catch (err) {
+      if (err instanceof CaptureTimeoutError) {
+        return fallbackToPixelAfterTimeout(
+          action,
+          tabId,
+          deadline,
+          err,
+          "pixel (dom-render roundtrip timed out)",
+          "domRenderRoundtrip",
+          "domRenderRoundtrip",
+          true
+        )
+      }
+      throw err
+    }
 
     if (!renderResult || !renderResult.success || !renderResult.data) {
-      return { success: false, error: renderResult?.error || "dom render returned no data" }
+      return {
+        success: false,
+        error: renderResult?.error || "dom render returned no data (content-script roundtrip produced no result)",
+        data: { layer: "domRenderRoundtrip" }
+      }
     }
 
     let dataUrl = renderResult.data.dataUrl
@@ -182,7 +337,7 @@ async function handleDomRenderScreenshot(
 
     if (requestedFormat === "webp") {
       try {
-        dataUrl = await reencodeAsWebP(dataUrl, webpQuality)
+        dataUrl = await withDeadlineTimeout("domRenderRoundtrip re-encode", reencodeAsWebP(dataUrl, webpQuality), deadline)
         outputFormat = "webp"
       } catch (err) {
         return { success: false, error: `webp re-encode failed: ${(err as Error).message}` }
@@ -205,42 +360,48 @@ async function handleDomRenderScreenshot(
 
 export async function handleScreenshotBackground(
   action: { type: string; [key: string]: unknown },
-  tabId: number
+  tabId: number,
+  deadline?: number
 ): Promise<ActionResult> {
   const format = (action.format as string) === "png" ? "image/png" : "image/jpeg"
   const quality = ((action.quality as number) || 50) / 100
   try {
-    const streamId = await withCaptureTimeout(
+    const streamId = await withDeadlineTimeout(
       "tabCapture.getMediaStreamId",
-      chrome.tabCapture.getMediaStreamId({ targetTabId: tabId })
+      chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }),
+      deadline
     )
     const contexts = await chrome.runtime.getContexts({
       contextTypes: ["OFFSCREEN_DOCUMENT" as chrome.runtime.ContextType]
     })
     if (contexts.length === 0) {
-      await withCaptureTimeout(
+      await withDeadlineTimeout(
         "offscreen.createDocument",
         chrome.offscreen.createDocument({
           url: "offscreen.html",
           reasons: ["USER_MEDIA" as chrome.offscreen.Reason],
           justification: "Background tab screenshot via tabCapture"
-        })
+        }),
+        deadline
       )
     }
-    await withCaptureTimeout(
+    await withDeadlineTimeout(
       "offscreen.capture_start",
       new Promise<void>((resolve) => {
         chrome.runtime.sendMessage({ target: "offscreen", type: "capture_start", streamId }, () => resolve())
-      })
+      }),
+      deadline
     )
     await new Promise(r => setTimeout(r, 300))
-    const frameResult = await withCaptureTimeout(
+    const frameResult = await withDeadlineTimeout(
       "offscreen.capture_frame",
-      sendToOffscreen({ type: "capture_frame", format, quality })
+      sendToOffscreen({ type: "capture_frame", format, quality }),
+      deadline
     ) as { success: boolean; data?: string; error?: string }
-    await withCaptureTimeout(
+    await withDeadlineTimeout(
       "offscreen.capture_stop",
-      sendToOffscreen({ type: "capture_stop" })
+      sendToOffscreen({ type: "capture_stop" }),
+      deadline
     ).catch(() => undefined)
     if (!frameResult.success) return { success: false, error: frameResult.error || "capture frame failed" }
     const dataUrl = frameResult.data!
@@ -251,7 +412,7 @@ export async function handleScreenshotBackground(
       return {
         success: false,
         error: `tabCapture timed out at ${err.operation} (${err.timeoutMs}ms)`,
-        data: { hint: VISIBILITY_HINT, layer: "tabCapture", timedOutAt: err.operation }
+        data: { hint: VISIBILITY_HINT, layer: "tabCapture", timedOutAt: err.operation, timedOutMs: err.timeoutMs, budgetExhausted: err.budgetExhausted }
       }
     }
     return { success: false, error: `tabCapture failed: ${(err as Error).message}` }
@@ -260,7 +421,8 @@ export async function handleScreenshotBackground(
 
 async function handlePixelScreenshot(
   action: { type: string; [key: string]: unknown },
-  tabId: number
+  tabId: number,
+  deadline?: number
 ): Promise<ActionResult> {
   // Output format requested by caller. WebP is supported via OffscreenCanvas
   // re-encode (chrome.tabs.captureVisibleTab itself only emits PNG/JPEG).
@@ -297,23 +459,31 @@ async function handlePixelScreenshot(
     }
 
     for (let i = 0; i < stripCount; i++) {
+      const stripsRemaining = stripCount - i
+      const stageReserve = stripsRemaining > 1 ? (stripsRemaining - 1) * SCREENSHOT_STAGE_FLOOR_MS : 0
+      const sharedStageDefault = deadline === undefined
+        ? CAPTURE_TIMEOUT_MS
+        : Math.max(SCREENSHOT_STAGE_FLOOR_MS, Math.floor((deadline - Date.now()) / stripsRemaining))
       const scrollTo = i * viewportHeight
       await sendToContentScript(tabId, { type: "scroll_absolute", y: scrollTo })
       await new Promise(r => setTimeout(r, 150))
       let stripUrl: string
       try {
-        stripUrl = await withCaptureTimeout(
+        stripUrl = await withDeadlineTimeout(
           `captureVisibleTab(strip ${i + 1}/${stripCount})`,
-          chrome.tabs.captureVisibleTab(fullTab.windowId, { format: captureFormat, quality })
+          chrome.tabs.captureVisibleTab(fullTab.windowId, { format: captureFormat, quality }),
+          deadline,
+          stageReserve,
+          sharedStageDefault
         )
       } catch (err) {
         await sendToContentScript(tabId, { type: "scroll_absolute", y: origScrollY }).catch(() => undefined)
         if (err instanceof CaptureTimeoutError) {
-          return {
-            success: false,
-            error: `full-page screenshot failed: ${err.operation} timed out after ${err.timeoutMs}ms`,
-            data: { hint: VISIBILITY_HINT, layer: "captureVisibleTab", strip: i + 1, totalStrips: stripCount, timedOutAt: err.operation }
-          }
+          const failure = captureBudgetFailure(err.operation, err.timeoutMs)
+          ;(failure.data as Record<string, unknown>).hint = VISIBILITY_HINT
+          ;(failure.data as Record<string, unknown>).strip = i + 1
+          ;(failure.data as Record<string, unknown>).totalStrips = stripCount
+          return failure
         }
         return { success: false, error: `captureVisibleTab failed on strip ${i + 1}/${stripCount}: ${(err as Error).message}` }
       }
@@ -345,14 +515,17 @@ async function handlePixelScreenshot(
     const stitchQuality = requestedFormat === "webp"
       ? (typeof action.quality === "number" ? (action.quality as number) : 85) / 100
       : quality / 100
-    const stitchedUrl = await stitchStripsInWorker(
-      strips,
-      naturalWidth,
-      naturalHeight,
-      requestedFormat,
-      stitchQuality,
-      stitchScale
-    )
+    let stitchedUrl: string | null
+    try {
+      stitchedUrl = await withOptionalDeadlineTimeout(
+        "captureVisibleTab stitch",
+        stitchStripsInWorker(strips, naturalWidth, naturalHeight, requestedFormat, stitchQuality, stitchScale),
+        deadline
+      )
+    } catch (err) {
+      if (err instanceof CaptureTimeoutError) return captureBudgetFailure(err.operation, err.timeoutMs)
+      return { success: false, error: `stitch failed: ${(err as Error).message}` }
+    }
     if (!stitchedUrl) return { success: false, error: "stitch failed (could not render strips into OffscreenCanvas)" }
     const stitchedSize = Math.round((stitchedUrl.length - stitchedUrl.indexOf(",") - 1) * 0.75)
     if (action.save) {
@@ -376,21 +549,24 @@ async function handlePixelScreenshot(
 
   let dataUrl: string
   try {
-    dataUrl = await withCaptureTimeout(
+    dataUrl = await withDeadlineTimeout(
       "captureVisibleTab",
-      chrome.tabs.captureVisibleTab(targetTab.windowId, { format: captureFormat, quality })
+      chrome.tabs.captureVisibleTab(targetTab.windowId, { format: captureFormat, quality }),
+      deadline
     )
   } catch (err) {
     if (err instanceof CaptureTimeoutError) {
-      return {
-        success: false,
-        error: `captureVisibleTab timed out after ${err.timeoutMs}ms`,
-        data: { hint: VISIBILITY_HINT, layer: "captureVisibleTab", timedOutAt: err.operation }
-      }
+      const failure = captureBudgetFailure(err.operation, err.timeoutMs)
+      ;(failure.data as Record<string, unknown>).hint = VISIBILITY_HINT
+      return failure
+    }
+    if (deadline !== undefined && deadline - Date.now() < TAB_CAPTURE_FALLBACK_MIN_BUDGET_MS) {
+      return captureBudgetFailure("captureVisibleTab fallback", Math.max(0, deadline - Date.now()))
     }
     const fallback = await handleScreenshotBackground(
       { type: "screenshot_background", format: action.format, quality: action.quality },
-      tabId
+      tabId,
+      deadline
     )
     if (fallback.success && fallback.data) {
       (fallback.data as Record<string, unknown>).fallback = "tabCapture (captureVisibleTab failed)"
@@ -400,14 +576,16 @@ async function handlePixelScreenshot(
 
   let clip = action.clip as { x: number; y: number; width: number; height: number } | undefined
   if (!clip && action.element !== undefined) {
-    const elemResult = await sendToContentScript(tabId, {
-      type: "rect", index: action.element
-    }) as { success: boolean; data?: { x: number; y: number; width: number; height: number } }
+    const elemResult = await withOptionalDeadlineTimeout(
+      "captureVisibleTab rect",
+      sendToContentScript(tabId, { type: "rect", index: action.element }),
+      deadline
+    ) as { success: boolean; data?: { x: number; y: number; width: number; height: number } }
     if (elemResult.success && elemResult.data) clip = elemResult.data
   }
 
   if (clip) {
-    const cropResult = await sendToOffscreen({ type: "crop", dataUrl, clip }) as {
+    const cropResult = await withOptionalDeadlineTimeout("captureVisibleTab crop", sendToOffscreen({ type: "crop", dataUrl, clip }), deadline) as {
       success: boolean; data?: string; error?: string
     }
     if (!cropResult.success) return { success: false, error: cropResult.error }
@@ -416,7 +594,17 @@ async function handlePixelScreenshot(
 
   // Post-capture transform — downsample to fit target_max_long_edge and/or
   // re-encode to WebP. Done in one OffscreenCanvas pass for efficiency.
-  const transformed = await transformPixelDataUrl(dataUrl, requestedFormat, action.quality as number | undefined, targetMaxLongEdge)
+  let transformed: Awaited<ReturnType<typeof transformPixelDataUrl>>
+  try {
+    transformed = await withOptionalDeadlineTimeout(
+      "captureVisibleTab transform",
+      transformPixelDataUrl(dataUrl, requestedFormat, action.quality as number | undefined, targetMaxLongEdge),
+      deadline
+    )
+  } catch (err) {
+    if (err instanceof CaptureTimeoutError) return captureBudgetFailure(err.operation, err.timeoutMs)
+    return { success: false, error: `post-capture transform failed: ${(err as Error).message}` }
+  }
   if (!transformed.success) return { success: false, error: transformed.error || "post-capture transform failed" }
   const finalUrl = transformed.dataUrl
   const finalSize = Math.round((finalUrl.length - finalUrl.indexOf(",") - 1) * 0.75)

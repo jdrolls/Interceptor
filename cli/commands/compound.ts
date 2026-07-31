@@ -6,11 +6,20 @@
  * combines the results into a single output.
  */
 
-import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
+import { type DaemonResponse } from "../transport"
+import { sendWithRecovery } from "../lib/self-heal"
 import { parseElementTarget } from "../parse"
+import type { TabResolvedVia } from "../../shared/tab-provenance"
 
 type Action = { type: string; [key: string]: unknown }
-type Result = { success: boolean; error?: string; data?: unknown; tabId?: number }
+type Result = {
+  success: boolean
+  error?: string
+  data?: unknown
+  tabId?: number
+  tabResolvedVia?: "stored" | "active-cold" | "active-drift"
+  resolvedTabUrl?: string
+}
 type ReadAggregate = {
   success: boolean
   tree?: string
@@ -37,9 +46,7 @@ function truncateText(text: string, maxChars: number): string {
 
 async function send(action: Action, tabId?: number, useWs = false): Promise<Result> {
   try {
-    const resp = useWs
-      ? await sendCommandWs(action, tabId)
-      : await sendCommand(action, tabId)
+    const resp = await sendWithRecovery(action, tabId, useWs)
     return unwrap(resp)
   } catch (err) {
     return { success: false, error: (err as Error).message }
@@ -79,6 +86,20 @@ export function aggregateReadResults(opts: {
   }
 
   return { success: true, tree: tree || undefined, text: text || undefined, warnings }
+}
+
+export function readRoutingFrom(
+  treeResult?: Result,
+  textResult?: Result
+): Pick<Result, "tabId" | "tabResolvedVia" | "resolvedTabUrl"> {
+  const result = [treeResult, textResult].find(candidate => candidate?.success)
+  if (!result) return {}
+
+  return {
+    ...(result.tabId !== undefined && { tabId: result.tabId }),
+    ...(result.tabResolvedVia !== undefined && { tabResolvedVia: result.tabResolvedVia }),
+    ...(result.resolvedTabUrl !== undefined && { resolvedTabUrl: result.resolvedTabUrl })
+  }
 }
 
 type ReadTarget = ReturnType<typeof parseElementTarget> | Record<string, never>
@@ -129,11 +150,12 @@ export async function runOpen(
   const textOnly = filtered.includes("--text-only")
   const full = filtered.includes("--full")
   const noWait = filtered.includes("--no-wait")
+  const forceNew = filtered.includes("--new")
   const timeoutIdx = filtered.indexOf("--timeout")
   const timeout = timeoutIdx !== -1 ? parseInt(filtered[timeoutIdx + 1]) : 5000
 
   // Step 1: Create tab
-  const createResult = await send({ type: "tab_create", url }, globalTabId, useWs)
+  const createResult = await send({ type: "tab_create", url, ...(forceNew ? { forceNew: true } : {}) }, globalTabId, useWs)
   if (!createResult.success) {
     output(jsonMode, { success: false, error: createResult.error || "failed to create tab" })
     return
@@ -302,9 +324,25 @@ export async function runRead(
   textContent = aggregate.text || ""
 
   if (jsonMode) {
-    const result: { success: boolean; data?: unknown; warning?: string } = {
+    const routing = readRoutingFrom(treeResult, textResult)
+    const result: {
+      success: boolean
+      data?: unknown
+      warning?: string
+      tabId?: number
+      tabResolvedVia?: TabResolvedVia
+      resolvedTabUrl?: string
+    } = {
       success: true,
-      data: { tree: treeData || undefined, text: textContent || undefined }
+      data: {
+        ...(globalTabId !== undefined && { tabId: globalTabId }),
+        ...(globalTabId === undefined && routing.tabId !== undefined && { tabId: routing.tabId }),
+        tree: treeData || undefined,
+        text: textContent || undefined
+      },
+      ...(routing.tabId !== undefined && { tabId: routing.tabId }),
+      ...(routing.tabResolvedVia !== undefined && { tabResolvedVia: routing.tabResolvedVia }),
+      ...(routing.resolvedTabUrl !== undefined && { resolvedTabUrl: routing.resolvedTabUrl })
     }
     if (aggregate.warnings?.length) result.warning = aggregate.warnings.join("; ")
     output(jsonMode, result)
