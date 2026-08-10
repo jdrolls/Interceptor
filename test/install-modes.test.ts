@@ -9,6 +9,7 @@
 
 import { describe, expect, test } from "bun:test"
 import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
 import { resolve } from "node:path"
 
 const REPO_ROOT = resolve(import.meta.dir, "..")
@@ -110,12 +111,39 @@ describe("install browser selection — dry-run", () => {
     expect(stdout).not.toContain("Google/Chrome/NativeMessagingHosts")
   })
 
-  test("non-interactive default (no --chrome/--brave) falls back to chrome with notice", () => {
-    const { stdout, status } = runInstallDryRun(["--browser-only"])
+  test("--helium installs only the Helium native-messaging path", () => {
+    const { stdout, status } = runInstallDryRun(["--browser-only", "--helium"])
     expect(status).toBe(0)
-    expect(stdout).toContain("defaulting to 'chrome' (non-interactive)")
-    expect(stdout).toContain("Browser: chrome")
-    expect(stdout).toContain("Google/Chrome/NativeMessagingHosts")
+    expect(stdout).toContain("Browser: helium")
+    expect(stdout).toContain("net.imput.helium/NativeMessagingHosts")
+    expect(stdout).not.toContain("Google/Chrome/NativeMessagingHosts")
     expect(stdout).not.toContain("BraveSoftware/Brave-Browser/NativeMessagingHosts")
+  })
+
+  /**
+   * dora-cc#1377: the non-interactive default used to be a hard-coded "chrome",
+   * which is how a Helium machine silently got its manifest written into Chrome.
+   * It now resolves by preference order over what is installed.
+   */
+  test("non-interactive default resolves by preference order, not a hard-coded chrome", () => {
+    const { stdout, status } = runInstallDryRun(["--browser-only"])
+
+    if (process.platform !== "darwin") {
+      // No /Applications to resolve against — the script must say so, not guess.
+      expect(status).not.toBe(0)
+      return
+    }
+
+    expect(status).toBe(0)
+    expect(stdout).not.toContain("defaulting to 'chrome'")
+
+    const installed = [
+      { id: "helium", app: "/Applications/Helium.app" },
+      { id: "brave", app: "/Applications/Brave Browser.app" },
+      { id: "chrome", app: "/Applications/Google Chrome.app" },
+    ].filter(b => existsSync(b.app))
+
+    // Preference order is helium > brave > chrome; the first installed one wins.
+    expect(stdout).toContain(`Browser: ${installed[0].id}`)
   })
 })

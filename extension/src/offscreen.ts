@@ -21,9 +21,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       ocrImage(msg.dataUrl).then(sendResponse)
       return true
 
+    // Answered, not fire-and-forget. `startCapture` used to swallow its own
+    // failure into console.error while the caller reported success:true — so a
+    // capture that never started only surfaced later, as a TypeError on the
+    // first `capture frame` (dora-cc#1377 ask 3).
     case "capture_start":
-      startCapture(msg.streamId)
-      return false
+      startCapture(msg.streamId).then(sendResponse)
+      return true
 
     case "capture_frame":
       captureFrame(msg.format, msg.quality).then(sendResponse)
@@ -218,8 +222,10 @@ async function startCapture(streamId: string) {
     captureVideo.srcObject = stream
     captureVideo.muted = true
     await captureVideo.play()
+    return { success: true, data: { width: captureVideo.videoWidth, height: captureVideo.videoHeight } }
   } catch (e) {
-    console.error("capture start failed:", e)
+    stopCapture()
+    return { success: false, error: `capture start failed: ${(e as Error).message}` }
   }
 }
 
