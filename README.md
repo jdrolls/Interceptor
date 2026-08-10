@@ -530,9 +530,21 @@ interceptor screenshot --pixel --full        # Pixel-true full-page (scroll + in
 interceptor screenshot --format webp         # png (default), jpeg, or webp
 interceptor screenshot --quality 80          # Encode quality 0-100 (defaults: png 92, jpeg 92, webp 85)
 interceptor screenshot --target-max-long-edge 1568   # Auto-resize at capture (clamps long edge)
+interceptor screenshot --stdout              # Print the base64 dataUrl (withheld by default)
 ```
 
 `screenshot` invocations are auto-routed through the WebSocket transport because base64 dataUrl responses larger than ~50KB are unreliable over the native-messaging port on Brave/Chromium. Override with `--no-ws` if needed.
+
+**The capture contract.** A verification tool that returns wrong-but-plausible evidence is worse than one that crashes, so `screenshot` fails loudly rather than returning something:
+
+| Condition | Behavior |
+|---|---|
+| Requested tab is not the window's visible tab (`--pixel` uses window-scoped `captureVisibleTab`) | Refuses, naming both tabs and both URLs. `INTERCEPTOR_ALLOW_TAB_DRIFT=1` opts back in and labels the capture with the tab it really came from |
+| Any unrecognised flag (e.g. `--out`) | Exit 1 naming the flag; no capture runs and no image is printed |
+| Any `error:` line | Exit 1 — never exit 0 with an error on the output |
+| Result JSON | Always carries the captured `url` and `tabId` |
+| Base64 payload on stdout | Withheld by default (`dataUrlOmitted` + byte count); use `--save` or `--stdout` |
+| DOM capture with `loading="lazy"` images below the fold | `lazyImages` census in the result and a stderr warning — an absent image is never silently absent |
 
 **Agent recipe for any consumer:** `interceptor screenshot --save --format webp --target-max-long-edge 1568 --quality 85` produces a ~50–100 KB WebP on disk and a path-only response — fits Anthropic's 1568 px cap exactly, eats zero context window, no auto-resize destruction.
 

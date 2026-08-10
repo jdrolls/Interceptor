@@ -14,6 +14,7 @@
 //     *`. The SW handler installs and removes that rule in a try/finally.
 
 import { resolveElement } from "./input-simulation"
+import { reportLazyImages, type LazyImageReport } from "../../../shared/screenshot-contract"
 
 type ActionResult = { success: boolean; error?: string; data?: unknown }
 
@@ -105,6 +106,30 @@ function resolveTarget(action: DomScreenshotAction): { node: HTMLElement | null;
     default:
       return { node: null, error: `unknown screenshot mode: ${mode}` }
   }
+}
+
+/**
+ * Account for `loading="lazy"` images inside the capture target.
+ *
+ * html-to-image rasterises the DOM exactly as it stands, so an image that has
+ * never entered the viewport was never fetched and renders as *nothing* — no
+ * box, no placeholder, no error. On a page being verified, that is
+ * indistinguishable from "the images are broken", which is the opposite of the
+ * truth (dora-cc#1383 finding 4). Counting them converts a silent false
+ * negative into a stated limitation.
+ */
+function surveyLazyImages(node: HTMLElement): LazyImageReport {
+  const imgs = Array.from(node.querySelectorAll("img"))
+  // A node-scoped query misses nothing in full mode (node is documentElement)
+  // and correctly ignores off-target images in element/selector mode.
+  return reportLazyImages(
+    imgs.map((img) => ({
+      loading: img.getAttribute("loading"),
+      complete: img.complete,
+      naturalWidth: img.naturalWidth,
+      src: img.getAttribute("src")
+    }))
+  )
 }
 
 export async function handleDomScreenshot(action: DomScreenshotAction): Promise<ActionResult> {
@@ -238,6 +263,7 @@ export async function handleDomScreenshot(action: DomScreenshotAction): Promise<
         height: outHeight,
         pixelRatio,
         mode: action.mode || "full",
+        lazyImages: surveyLazyImages(node),
       }
     }
   } catch (err) {

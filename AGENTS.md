@@ -486,10 +486,13 @@ Flag reference:
 - `--element <ref>` — capture a refRegistry-tracked element (`e5`, `e2_7`).
 - `--region X,Y,W,H` — capture an arbitrary page rectangle.
 - `--scale <n>` — override pixel ratio. `--target-max-long-edge` wins when both set.
-- `--pixel` — pixel-true compositor capture via `chrome.tabs.captureVisibleTab`. Requires the browser window visible and focused. Use only when DOM-render fidelity is insufficient (compositor effects, hardware video frames, chrome itself).
+- `--pixel` — pixel-true compositor capture via `chrome.tabs.captureVisibleTab`. Requires the browser window visible and focused, and the target tab to be that window's *visible* tab — `captureVisibleTab` is window-scoped, so capturing while a different tab is in front would hand back the wrong page. Interceptor refuses that capture rather than returning it. Use only when DOM-render fidelity is insufficient (compositor effects, hardware video frames, chrome itself).
 - `--pixel --full` — scroll-and-stitch full page. Throttled to clear Chrome's 2/sec `captureVisibleTab` quota; expect ~1.1s per viewport strip.
+- `--stdout` — print the base64 `dataUrl` on stdout. Withheld by default: an unrequested full-page payload is megabytes of base64 that floods your context window for nothing. The default result carries `dataUrlOmitted` plus the byte count; use `--save` when you want the bytes.
 
 Default DOM-render works from a backgrounded Chrome on a different macOS Space — no focus required.
+
+**Trusting a capture.** Every screenshot result names the `url` and `tabId` it came from — check them before treating the image as evidence. A failed capture exits non-zero (an `error:` line is never accompanied by exit 0), and an unrecognised flag is a hard usage error rather than a silently-ignored argument. A DOM capture cannot rasterize `loading="lazy"` images that never entered the viewport; when it drops some, the result carries a `lazyImages` census and the CLI warns on stderr. Missing images in a DOM capture are therefore reported, not inferred — scroll the page first, or use `--pixel --full`, before concluding a page's images are broken.
 
 ## Data, Storage, History, Bookmarks
 
