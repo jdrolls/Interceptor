@@ -2,6 +2,7 @@ import { sendToContentScript } from "../content-bridge"
 import { sendToOffscreen } from "../offscreen"
 import { installScreenshotCorsRule, uninstallScreenshotCorsRule } from "./screenshot-cors"
 import { deriveStageBudget } from "./screenshot-budget"
+import { assertCaptureTarget } from "../../../../shared/screenshot-contract"
 
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
 
@@ -28,7 +29,15 @@ const TAB_CAPTURE_FALLBACK_MIN_BUDGET_MS = CAPTURE_TIMEOUT_MS
 type DomRenderResult = {
   success: boolean
   error?: string
-  data?: { dataUrl: string; format: string; width: number; height: number; pixelRatio: number; mode: string }
+  data?: {
+    dataUrl: string
+    format: string
+    width: number
+    height: number
+    pixelRatio: number
+    mode: string
+    lazyImages?: { lazyTotal: number; lazyNotRendered: number; sample: string[] }
+  }
 }
 const VISIBILITY_HINT = "Chrome/Brave window may not be visible — bring it to the front and retry, or pass --tab <id> of a tab in a visible window."
 
@@ -345,15 +354,132 @@ async function handleDomRenderScreenshot(
     }
 
     const sizeBytes = Math.round((dataUrl.length - dataUrl.indexOf(",") - 1) * 0.75)
+    // Carry the lazy-image census up to the CLI so a capture missing below-the-fold
+    // images says so instead of reading as broken images (dora-cc#1383 ask 6).
+    const lazyImages = renderResult.data.lazyImages
 
     if (action.save) {
-      return { success: true, data: { dataUrl, format: outputFormat, size: sizeBytes, width, height, mode, save: true } }
+      return { success: true, data: { dataUrl, format: outputFormat, size: sizeBytes, width, height, mode, save: true, ...(lazyImages && { lazyImages }) } }
     }
 
-    return { success: true, data: { dataUrl, format: outputFormat, size: sizeBytes, width, height, mode } }
+    return { success: true, data: { dataUrl, format: outputFormat, size: sizeBytes, width, height, mode, ...(lazyImages && { lazyImages }) } }
   } finally {
     await uninstallScreenshotCorsRule(tabId)
   }
+}
+
+// ─── Capture-target resolution (dora-cc#1383 ask 1) ───────────────────────────
+
+type ResolvedCapture = {
+  windowId: number
+  capturedTabId: number
+  capturedTabUrl?: string
+  drifted: boolean
+}
+
+/**
+ * Work out which tab `chrome.tabs.captureVisibleTab` will actually photograph.
+ *
+ * It takes a *windowId*, not a tabId — so a perfectly-resolved target tab that
+ * happens not to be the foreground tab yields a clean, correctly-sized image of
+ * an entirely different page, at exit 0. That is the wrong-page evidence #1383
+ * was filed for, and it is invisible unless the operator recognises the page.
+ * Refuse by default; INTERCEPTOR_ALLOW_TAB_DRIFT=1 opts back in and the capture
+ * is then labelled with the tab it really came from.
+ */
+async function resolveCaptureTarget(
+  tabId: number,
+  allowTabDrift: boolean
+): Promise<{ ok: true; capture: ResolvedCapture } | { ok: false; failure: ActionResult }> {
+  const targetTab = await chrome.tabs.get(tabId).catch(() => null)
+  if (!targetTab) {
+    return { ok: false, failure: { success: false, error: `tab ${tabId} not found`, data: { hint: VISIBILITY_HINT } } }
+  }
+
+  const targetWindow = await chrome.windows.get(targetTab.windowId, { populate: false }).catch(() => null)
+  if (targetWindow && targetWindow.state === "minimized") {
+    return {
+      ok: false,
+      failure: {
+        success: false,
+        error: `window ${targetTab.windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
+        data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: targetWindow.state }
+      }
+    }
+  }
+
+  const [visibleTab] = await chrome.tabs.query({ active: true, windowId: targetTab.windowId })
+  const check = assertCaptureTarget({
+    requestedTabId: tabId,
+    requestedTabUrl: targetTab.url,
+    visibleTabId: visibleTab?.id,
+    visibleTabUrl: visibleTab?.url,
+    windowId: targetTab.windowId,
+    allowTabDrift
+  })
+
+  if (!check.ok) {
+    return {
+      ok: false,
+      failure: {
+        success: false,
+        error: check.error,
+        data: {
+          layer: "captureTarget",
+          requestedTabId: tabId,
+          requestedTabUrl: targetTab.url,
+          ...(check.capturedTabId !== undefined && { visibleTabId: check.capturedTabId }),
+          ...(check.capturedTabUrl !== undefined && { visibleTabUrl: check.capturedTabUrl })
+        }
+      }
+    }
+  }
+
+  if (check.drifted) {
+    return {
+      ok: true,
+      capture: {
+        windowId: targetTab.windowId,
+        capturedTabId: check.capturedTabId,
+        capturedTabUrl: check.capturedTabUrl,
+        drifted: true
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    capture: { windowId: targetTab.windowId, capturedTabId: tabId, capturedTabUrl: targetTab.url, drifted: false }
+  }
+}
+
+/**
+ * Name the page every capture actually came from.
+ *
+ * A screenshot result that says only "27KB, jpeg" is unfalsifiable — the #1383
+ * wrong-page capture was caught by eye, not by the payload. Stamping url+tabId
+ * makes a mis-targeted capture self-evident to any reader (ask 2).
+ */
+async function stampCaptureProvenance(
+  result: ActionResult,
+  fallbackTabId: number,
+  known?: { tabId: number; url?: string; drifted: boolean }
+): Promise<ActionResult> {
+  if (!result.success || !result.data || typeof result.data !== "object") return result
+  const d = result.data as Record<string, unknown>
+
+  if (known) {
+    d.tabId = known.tabId
+    if (known.url !== undefined) d.url = known.url
+    if (known.drifted) d.tabDrift = "captured the window's visible tab, not the requested tab (INTERCEPTOR_ALLOW_TAB_DRIFT=1)"
+  }
+
+  if (typeof d.tabId !== "number") d.tabId = fallbackTabId
+  if (typeof d.url !== "string") {
+    const tab = await chrome.tabs.get(d.tabId as number).catch(() => null)
+    if (tab?.url) d.url = tab.url
+  }
+  return result
 }
 
 // ─── Pixel-true path (--pixel escape hatch) ───────────────────────────────────
@@ -424,6 +550,22 @@ async function handlePixelScreenshot(
   tabId: number,
   deadline?: number
 ): Promise<ActionResult> {
+  const resolved = await resolveCaptureTarget(tabId, action.allowTabDrift === true)
+  if (!resolved.ok) return resolved.failure
+  const result = await capturePixels(action, tabId, resolved.capture, deadline)
+  return stampCaptureProvenance(result, tabId, {
+    tabId: resolved.capture.capturedTabId,
+    url: resolved.capture.capturedTabUrl,
+    drifted: resolved.capture.drifted
+  })
+}
+
+async function capturePixels(
+  action: { type: string; [key: string]: unknown },
+  tabId: number,
+  capture: ResolvedCapture,
+  deadline?: number
+): Promise<ActionResult> {
   // Output format requested by caller. WebP is supported via OffscreenCanvas
   // re-encode (chrome.tabs.captureVisibleTab itself only emits PNG/JPEG).
   const requestedFormat = (action.format as string) === "webp" ? "webp"
@@ -447,17 +589,6 @@ async function handlePixelScreenshot(
     const stripCount = Math.ceil(scrollHeight / viewportHeight)
     const strips: { dataUrl: string; y: number }[] = []
 
-    const fullTab = await chrome.tabs.get(tabId).catch(() => null)
-    if (!fullTab) return { success: false, error: `tab ${tabId} not found`, data: { hint: VISIBILITY_HINT } }
-    const fullWindow = await chrome.windows.get(fullTab.windowId, { populate: false }).catch(() => null)
-    if (fullWindow && fullWindow.state === "minimized") {
-      return {
-        success: false,
-        error: `window ${fullTab.windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
-        data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: fullWindow.state }
-      }
-    }
-
     for (let i = 0; i < stripCount; i++) {
       const stripsRemaining = stripCount - i
       const stageReserve = stripsRemaining > 1 ? (stripsRemaining - 1) * SCREENSHOT_STAGE_FLOOR_MS : 0
@@ -471,7 +602,7 @@ async function handlePixelScreenshot(
       try {
         stripUrl = await withDeadlineTimeout(
           `captureVisibleTab(strip ${i + 1}/${stripCount})`,
-          chrome.tabs.captureVisibleTab(fullTab.windowId, { format: captureFormat, quality }),
+          chrome.tabs.captureVisibleTab(capture.windowId, { format: captureFormat, quality }),
           deadline,
           stageReserve,
           sharedStageDefault
@@ -534,24 +665,11 @@ async function handlePixelScreenshot(
     return { success: true, data: { dataUrl: stitchedUrl, format: requestedFormat, size: stitchedSize, strips: stripCount } }
   }
 
-  const targetTab = await chrome.tabs.get(tabId).catch(() => null)
-  if (!targetTab) {
-    return { success: false, error: `tab ${tabId} not found`, data: { hint: VISIBILITY_HINT } }
-  }
-  const targetWindow = await chrome.windows.get(targetTab.windowId, { populate: false }).catch(() => null)
-  if (targetWindow && targetWindow.state === "minimized") {
-    return {
-      success: false,
-      error: `window ${targetTab.windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
-      data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: targetWindow.state }
-    }
-  }
-
   let dataUrl: string
   try {
     dataUrl = await withDeadlineTimeout(
       "captureVisibleTab",
-      chrome.tabs.captureVisibleTab(targetTab.windowId, { format: captureFormat, quality }),
+      chrome.tabs.captureVisibleTab(capture.windowId, { format: captureFormat, quality }),
       deadline
     )
   } catch (err) {
@@ -689,21 +807,26 @@ export async function handleScreenshotActions(
 ): Promise<ActionResult> {
   switch (action.type) {
     case "screenshot_background":
-      return handleScreenshotBackground(action, tabId)
+      return stampCaptureProvenance(await handleScreenshotBackground(action, tabId), tabId)
 
     case "page_capture": {
       const mhtml = await chrome.pageCapture.saveAsMHTML({ tabId })
       const text = await (mhtml as Blob).text()
-      return { success: true, data: { size: text.length, preview: text.slice(0, 500) } }
+      return stampCaptureProvenance(
+        { success: true, data: { size: text.length, preview: text.slice(0, 500) } },
+        tabId
+      )
     }
 
     case "screenshot": {
       // --pixel flag routes to the legacy captureVisibleTab path. Default
-      // path is the DOM-render pipeline.
+      // path is the DOM-render pipeline. Both stamp the captured url+tabId so
+      // a mis-targeted capture is self-evident (dora-cc#1383 ask 2); the pixel
+      // wrapper stamps first because it alone knows about allowed drift.
       if (action.pixel === true) {
         return handlePixelScreenshot(action, tabId)
       }
-      return handleDomRenderScreenshot(action, tabId)
+      return stampCaptureProvenance(await handleDomRenderScreenshot(action, tabId), tabId)
     }
   }
   return { success: false, error: `unknown screenshot action: ${action.type}` }

@@ -2,6 +2,8 @@
  * cli/commands/screenshot.ts — screenshot, canvas, capture
  */
 
+import { validateScreenshotFlags } from "../../shared/screenshot-contract"
+
 type Action = { type: string; [key: string]: unknown }
 
 export function parseScreenshotCommand(filtered: string[]): Action {
@@ -9,6 +11,15 @@ export function parseScreenshotCommand(filtered: string[]): Action {
 
   switch (cmd) {
     case "screenshot": {
+      // An unrecognised flag means the caller's intent was not honoured. The
+      // old parser ignored it and captured anyway, so `--out /tmp/x.png` (no
+      // such flag — it is `--save`) exited 0 having written nothing and dumped
+      // the whole base64 image to stdout instead (dora-cc#1383 finding 2).
+      const flags = validateScreenshotFlags(filtered.slice(1))
+      if (!flags.ok) {
+        console.error(`error: ${flags.error}`)
+        process.exit(1)
+      }
       if (filtered.includes("--background")) {
         const bgAction: Action = { type: "screenshot_background" }
         if (filtered.includes("--format")) bgAction.format = filtered[filtered.indexOf("--format") + 1]

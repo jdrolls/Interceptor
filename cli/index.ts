@@ -25,6 +25,7 @@ import { runInitCommand } from "./commands/init"
 import { runDoctorCommand } from "./commands/doctor"
 import { VERSION, BUILD_SHA, BUILD_DATE } from "./version"
 import { extractBlankWarning } from "../shared/frame-analysis"
+import { extractLazyImageWarning, gateDataUrl } from "../shared/screenshot-contract"
 
 // Command → module routing
 const STATE_CMDS = new Set(["state", "tree", "diff", "find", "text", "html"])
@@ -78,6 +79,8 @@ async function main() {
   // the documented 1MB native-messaging limit). The WebSocket transport does
   // not exhibit this issue, so we auto-route screenshot through it.
   const isScreenshotCmd = args[0] === "screenshot"
+  // Opt-in to the raw base64 payload on stdout; withheld by default.
+  const wantsStdout = args.includes("--stdout")
   const useWs = args.includes("--ws") || (isScreenshotCmd && !args.includes("--no-ws"))
   const anyTab = args.includes("--any-tab")
   const globalTabId = parseTabFlag(args)
@@ -242,6 +245,13 @@ async function main() {
     const blankWarning = extractBlankWarning(result.data)
     if (blankWarning) process.stderr.write(`warning: ${blankWarning}\n`)
 
+    // A DOM capture rasterises the page as it stands, so an image below the
+    // fold with loading="lazy" is simply absent — visually identical to a
+    // broken image. Say so rather than letting the omission read as a finding
+    // (dora-cc#1383 ask 6).
+    const lazyWarning = extractLazyImageWarning(result.data)
+    if (lazyWarning) process.stderr.write(`warning: ${lazyWarning}\n`)
+
     // Screenshot save-to-disk post-processing
     if (result.success && result.data && typeof result.data === "object" &&
         (result.data as Record<string, unknown>).save &&
@@ -258,6 +268,32 @@ async function main() {
       delete d.save
       delete d.dataUrl
       process.stderr.write(`saved: ${d.filePath}\n`)
+    }
+
+    // A full-page capture is megabytes of base64. Printing it by default
+    // floods a terminal and an agent's context window while carrying nothing
+    // either can read, so withhold it unless the caller asked with --stdout
+    // (dora-cc#1383 ask 4). --save already strips it above.
+    if (isScreenshotCmd && !wantsStdout && result.data && typeof result.data === "object") {
+      const d = result.data as Record<string, unknown>
+      if (typeof d.dataUrl === "string") {
+        const gate = gateDataUrl(d.dataUrl, { stdout: wantsStdout })
+        if (!gate.emit) {
+          delete d.dataUrl
+          Object.assign(d, gate.replacement)
+        }
+      }
+    }
+
+    // An 'error:' line is a failed verification. Exiting 0 lets any script or
+    // agent branching on the exit code record a false pass (dora-cc#1383
+    // finding 3), so a failed result exits non-zero and prints on stderr.
+    // --json keeps the body on stdout so structured consumers still parse it.
+    if (!result.success) {
+      const rendered = formatResult(result, jsonMode)
+      if (jsonMode) console.log(rendered)
+      else console.error(rendered)
+      process.exit(1)
     }
 
     // Pretty-print known result types

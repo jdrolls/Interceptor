@@ -102,6 +102,7 @@ Capture:
   interceptor screenshot --scale 2           Override pixel ratio (e.g. retina from 1x display)
   interceptor screenshot --pixel             Pixel-true compositor capture (legacy captureVisibleTab — requires Chrome focused)
   interceptor screenshot --save              Save to disk; result has filePath, no dataUrl
+  interceptor screenshot --stdout            Print the base64 dataUrl (withheld by default)
   interceptor screenshot --format png        Output format: png (default), jpeg, or webp
   interceptor screenshot --quality 80        Encode quality 0-100 (defaults: png 92, jpeg 92, webp 85)
   interceptor screenshot --target-max-long-edge 1568   Clamp output long edge in pixels (auto-resize at capture)

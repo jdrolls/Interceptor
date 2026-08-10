@@ -167,6 +167,13 @@ export async function handleDaemonMessage(msg: {
     }
   }
 
+  // The pixel-capture path needs the same drift allowance the tab resolver
+  // uses: captureVisibleTab is window-scoped, so it can hand back a different
+  // tab's pixels even when tab resolution itself was clean (dora-cc#1383
+  // finding 1). Carry the opt-out down rather than re-reading the env in the
+  // extension, which has no access to it.
+  if (msg.allowTabDrift) action.allowTabDrift = true
+
   try {
     let result = await routeAction(action, tabId!)
     if (tabId) result.tabId = tabId
