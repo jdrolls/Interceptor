@@ -17,6 +17,22 @@ import { analyzeLuma, classifyBlankFrame, type BlankVerdict } from "../../../../
 /** Longest edge the frame is downsampled to before the luma pass. */
 export const ANALYSIS_MAX_EDGE = 256
 
+/**
+ * Hard ceiling on the check itself. Screenshots already run under an absolute
+ * 12s budget beneath the CLI's 15s WebSocket ceiling; a diagnostic bolted onto
+ * the end of that must not be able to spend the remaining margin decoding a
+ * 20MB full-page stitch. Over budget, the frame goes back unannotated —
+ * unknown, not blank.
+ */
+export const ANALYSIS_BUDGET_MS = 1_500
+
+function withBudget<T>(work: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([
+    work,
+    new Promise<null>(resolve => setTimeout(() => resolve(null), ms)),
+  ])
+}
+
 export type BlankAnnotation = {
   blank: boolean
   kind: BlankVerdict["kind"]
@@ -72,7 +88,7 @@ export async function annotateBlankFrame<T extends AnnotatableResult>(result: T)
   const dataUrl = (data as { dataUrl?: unknown }).dataUrl
   if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) return result
 
-  const annotation = await inspectDataUrl(dataUrl)
+  const annotation = await withBudget(inspectDataUrl(dataUrl), ANALYSIS_BUDGET_MS)
   if (!annotation) return result
   return { ...result, data: { ...(data as Record<string, unknown>), blank: annotation } }
 }
