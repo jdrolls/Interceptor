@@ -24,6 +24,7 @@ import { runUpgradeCommand } from "./commands/upgrade"
 import { runInitCommand } from "./commands/init"
 import { runDoctorCommand } from "./commands/doctor"
 import { VERSION, BUILD_SHA, BUILD_DATE } from "./version"
+import { extractBlankWarning } from "../shared/frame-analysis"
 
 // Command → module routing
 const STATE_CMDS = new Set(["state", "tree", "diff", "find", "text", "html"])
@@ -233,6 +234,13 @@ async function main() {
   try {
     const response = await sendWithRecovery(action, globalTabId, useWs)
     const result = unwrapResult(response)
+
+    // A capture with no picture in it must not read as evidence. Warn on stderr
+    // BEFORE the save step, so the message is attached to the capture even when
+    // stdout is a redirected JSON body or the image went straight to disk
+    // (dora-cc#1377 ask 4).
+    const blankWarning = extractBlankWarning(result.data)
+    if (blankWarning) process.stderr.write(`warning: ${blankWarning}\n`)
 
     // Screenshot save-to-disk post-processing
     if (result.success && result.data && typeof result.data === "object" &&

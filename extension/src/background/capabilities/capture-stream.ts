@@ -1,4 +1,10 @@
-import { sendToOffscreen } from "../offscreen"
+import {
+  ensureOffscreenForCapture,
+  sendToCaptureOffscreen,
+  sendToOffscreen,
+  unpinOffscreen,
+} from "../offscreen"
+import { annotateBlankFrame } from "./frame-analysis"
 
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
 
@@ -9,33 +15,37 @@ export async function handleCaptureStreamActions(
   switch (action.type) {
     case "capture_start": {
       const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId })
-      const contexts = await chrome.runtime.getContexts({
-        contextTypes: ["OFFSCREEN_DOCUMENT" as chrome.runtime.ContextType]
-      })
-      if (contexts.length === 0) {
-        await chrome.offscreen.createDocument({
-          url: "offscreen.html",
-          reasons: ["USER_MEDIA" as chrome.offscreen.Reason],
-          justification: "Tab capture stream processing"
-        })
+      // Rebuild the document with USER_MEDIA and pin it, so neither a
+      // pre-existing BLOBS document nor the 30s idle reaper can leave the
+      // stream unreachable to the very next `capture frame` (dora-cc#1377).
+      await ensureOffscreenForCapture()
+      const started = await sendToCaptureOffscreen({ type: "capture_start", streamId })
+      if (!started.success) {
+        unpinOffscreen()
+        return { success: false, error: started.error || "capture start failed" }
       }
-      chrome.runtime.sendMessage({ target: "offscreen", type: "capture_start", streamId })
-      return { success: true, data: { streamId, tabId } }
+      return { success: true, data: { streamId, tabId, ...(started.data as object ?? {}) } }
     }
 
     case "capture_frame": {
       const fmt = (action.format as string) === "png" ? "image/png" : "image/jpeg"
       const qual = (action.quality as number) || 50
-      const frameResult = await sendToOffscreen({
+      const frameResult = await sendToCaptureOffscreen({
         type: "capture_frame", format: fmt, quality: qual / 100
-      }) as { success: boolean; data?: string; error?: string }
+      })
       if (!frameResult.success) return { success: false, error: frameResult.error }
-      return { success: true, data: { dataUrl: frameResult.data } }
+      const dataUrl = frameResult.data
+      if (typeof dataUrl !== "string") {
+        return { success: false, error: "capture frame returned no image data" }
+      }
+      return annotateBlankFrame({ success: true, data: { dataUrl } })
     }
 
     case "capture_stop": {
-      await sendToOffscreen({ type: "capture_stop" })
+      const stopped = await sendToCaptureOffscreen({ type: "capture_stop" })
+      unpinOffscreen()
       try { await chrome.offscreen.closeDocument() } catch {}
+      if (!stopped.success) return { success: false, error: stopped.error }
       return { success: true }
     }
 
@@ -46,7 +56,7 @@ export async function handleCaptureStreamActions(
         image2: action.image2 as string,
         threshold: (action.threshold as number) || 0,
         returnImage: (action.returnImage as boolean) || false
-      }) as { success: boolean; data?: unknown; error?: string }
+      })
       if (!diffResult.success) return { success: false, error: diffResult.error }
       return { success: true, data: diffResult.data }
     }

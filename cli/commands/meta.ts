@@ -10,12 +10,13 @@ import { existsSync, readFileSync } from "node:fs"
 import { parseElementTarget } from "../parse"
 import {
   readStatusSnapshot,
-  detectConfiguredBrowsers,
   detectMacOSDefaultBrowser,
   formatStatus,
   snapshotToJson,
   type StatusSnapshot,
 } from "../lib/status-renderer"
+import { buildBrowserBlock } from "../lib/browser-binding"
+import type { BrowserId } from "../../shared/browsers"
 import { sendCommand } from "../transport"
 
 type Action = { type: string; [key: string]: unknown }
@@ -56,20 +57,25 @@ export async function parseMetaCommand(filtered: string[], jsonMode = false): Pr
       const verbose = filtered.includes("--verbose") || filtered.includes("--explain") || filtered.includes("-v")
       const snap: StatusSnapshot = readStatusSnapshot()
 
-      // Browser-config block (#52) — verbose-only, macOS-only.
-      if (verbose && process.platform === "darwin") {
-        const configured = detectConfiguredBrowsers()
-        const sysDefault = detectMacOSDefaultBrowser()
+      // Browser block (#52 + dora-cc#1377) — macOS. The BINDING half is not
+      // verbose-gated: `status` must name the browser binary it is driving
+      // without being asked, because the run that gets it wrong never thinks
+      // to ask.
+      if (process.platform === "darwin") {
+        const block = await buildBrowserBlock()
+        const sysDefault = verbose ? detectMacOSDefaultBrowser() : null
         let matches: boolean | null = null
-        if (sysDefault && configured.length > 0) {
-          matches = configured.some(b => b === sysDefault) || (sysDefault === "chrome" || sysDefault === "brave")
-            ? configured.includes(sysDefault as "chrome" | "brave")
-            : false
+        if (sysDefault && block.configured.length > 0) {
+          matches = block.configured.includes(sysDefault as BrowserId)
         }
         snap.browser = {
-          configured,
+          configured: block.configured,
           systemDefault: sysDefault,
           matches,
+          bound: block.bound,
+          preferred: block.preferred,
+          policyOk: block.policyOk,
+          policyDetail: block.policyDetail,
         }
       }
 

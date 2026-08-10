@@ -9,6 +9,8 @@
 import { existsSync, readFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { IS_WIN, SOCKET_PATH, PID_PATH, transportLabel } from "../../shared/platform"
+import { BROWSERS, type BrowserId } from "../../shared/browsers"
+import { describeBinding, installedManifestBrowsers, type BoundBrowser } from "./browser-binding"
 
 export type StatusSnapshot = {
   mode: "browser-only" | "full" | "unknown"
@@ -20,11 +22,19 @@ export type StatusSnapshot = {
   bridgePid: number | null
   bridgeSocket: string | null
   launchAgentInstalled: boolean
-  // #52 browser-config block — populated only on macOS in verbose mode
+  // #52 browser-config block — populated on macOS. `bound` (dora-cc#1377) is
+  // the only field that describes THIS session; the rest describe the install.
   browser?: {
-    configured: ("chrome" | "brave")[]   // browsers with NMH manifest installed
-    systemDefault: "chrome" | "brave" | "safari" | "firefox" | "other" | null
+    configured: BrowserId[]              // browsers with NMH manifest installed
+    systemDefault: BrowserId | "safari" | "firefox" | "other" | null
     matches: boolean | null              // null when systemDefault unknown
+    /** The browser process holding the daemon's WebSocket port right now. */
+    bound?: BoundBrowser | null
+    /** The browser the Helium-first policy says should be bound. */
+    preferred?: BrowserId | null
+    /** false when a more-preferred browser is installed but a lesser one is bound. */
+    policyOk?: boolean
+    policyDetail?: string
   }
   // #49 extension-reachability probe result — populated only when verbose+daemonAlive
   extension?: {
@@ -99,7 +109,7 @@ export function readStatusSnapshot(): StatusSnapshot {
  * "unknown" rather than throwing.
  */
 export function detectMacOSDefaultBrowser():
-  "chrome" | "brave" | "safari" | "firefox" | "other" | null {
+  BrowserId | "safari" | "firefox" | "other" | null {
   if (process.platform !== "darwin") return null
   try {
     // LaunchServices preferences live in a binary plist; convert to JSON.
@@ -115,8 +125,10 @@ export function detectMacOSDefaultBrowser():
     )
     const bundle = (httpHandler?.LSHandlerRoleAll as string) || ""
     const lower = bundle.toLowerCase()
+    for (const spec of BROWSERS) {
+      if (lower.includes(spec.bundleId.toLowerCase())) return spec.id
+    }
     if (lower.includes("brave")) return "brave"
-    if (lower.includes("google.chrome")) return "chrome"
     if (lower.includes("safari")) return "safari"
     if (lower.includes("firefox")) return "firefox"
     if (!bundle) return null
@@ -128,18 +140,13 @@ export function detectMacOSDefaultBrowser():
 
 /**
  * Detect which browsers have an Interceptor native messaging host manifest
- * installed in their per-user dir.
+ * installed in their per-user dir. Driven off `shared/browsers.ts` so adding a
+ * browser to the registry teaches install, status, and doctor at once — the
+ * hand-listed chrome/brave pair here is what made Helium invisible
+ * (dora-cc#1377).
  */
-export function detectConfiguredBrowsers(): ("chrome" | "brave")[] {
-  const home = process.env.HOME || ""
-  const out: ("chrome" | "brave")[] = []
-  if (existsSync(`${home}/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.interceptor.host.json`)) {
-    out.push("chrome")
-  }
-  if (existsSync(`${home}/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.interceptor.host.json`)) {
-    out.push("brave")
-  }
-  return out
+export function detectConfiguredBrowsers(): BrowserId[] {
+  return installedManifestBrowsers(process.env.HOME || "", existsSync)
 }
 
 /**
@@ -191,19 +198,38 @@ export function formatStatus(snap: StatusSnapshot, opts: { verbose?: boolean }):
     lines.push("To enable native macOS control:    interceptor upgrade --full")
   }
 
-  // browser config block (#52) — verbose-only on macOS
-  if (snap.browser) {
+  // browser block (#52 + dora-cc#1377) — macOS.
+  //
+  // Terse mode prints ONE line, and it is the binding rather than the install
+  // list: "which browser binary am I driving" is the question a verification
+  // run has, and answering it by default is what closes dora-cc#1377.
+  if (snap.browser && !v) {
     lines.push("")
-    if (v) {
-      lines.push("browser (which browser the extension is installed into; whether system default matches):")
-    } else {
-      lines.push("browser:")
+    lines.push(`browser: ${describeBinding(snap.browser.bound ?? null)}`)
+    if (snap.browser.policyOk === false) {
+      lines.push(`  ⚠ ${snap.browser.policyDetail ?? "bound browser is not the preferred one"}`)
     }
+  } else if (snap.browser) {
+    lines.push("")
+    lines.push("browser (which browser the extension is bound to and installed into; whether system default matches):")
     const cfg = snap.browser.configured.length === 0
       ? "(none — run scripts/install.sh and load the extension)"
       : snap.browser.configured.join(", ")
+    // `bound` first: it is the only line that answers "what am I driving right
+    // now", which is the question a verification run actually has.
+    if (snap.browser.bound !== undefined) {
+      lines.push(`  bound:          ${describeBinding(snap.browser.bound)}`)
+    }
     lines.push(`  configured:     ${cfg}`)
     lines.push(`  system default: ${snap.browser.systemDefault ?? "unknown"}`)
+    if (snap.browser.preferred) {
+      lines.push(`  preferred:      ${snap.browser.preferred}`)
+    }
+    if (snap.browser.policyOk === false) {
+      lines.push(`  policy:         ⚠ ${snap.browser.policyDetail ?? "bound browser is not the preferred one"}`)
+    } else if (snap.browser.policyOk === true && snap.browser.bound) {
+      lines.push("  policy:         ✓ preferred browser")
+    }
     if (snap.browser.matches === true) {
       lines.push("  status:         ✓ matches")
     } else if (snap.browser.matches === false) {

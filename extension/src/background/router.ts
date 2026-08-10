@@ -3,6 +3,7 @@ import { sendToContentScript } from "./content-bridge"
 import { activeTransport } from "./transport"
 import { handleOsInputActions } from "./capabilities/os-input"
 import { handleScreenshotActions } from "./capabilities/screenshot"
+import { annotateBlankFrame } from "./capabilities/frame-analysis"
 import { handleCaptureStreamActions } from "./capabilities/capture-stream"
 import { handleCanvasActions } from "./capabilities/canvas"
 import { handleTabActions } from "./capabilities/tabs"
@@ -91,7 +92,13 @@ export async function routeAction(
   tabId: number
 ): Promise<ActionResult> {
   if (OS_INPUT_ACTIONS.has(action.type)) return handleOsInputActions(action, tabId)
-  if (SCREENSHOT_ACTIONS.has(action.type)) return handleScreenshotActions(action, tabId)
+  // Every screenshot leaves through this one call, so the blank-frame check
+  // lives here rather than at the ~30 return sites inside the capability. A
+  // capture that contains no picture is still returned — it is just no longer
+  // returned silently (dora-cc#1377 ask 4).
+  if (SCREENSHOT_ACTIONS.has(action.type)) {
+    return annotateBlankFrame(await handleScreenshotActions(action, tabId))
+  }
   if (CAPTURE_STREAM_ACTIONS.has(action.type)) return handleCaptureStreamActions(action, tabId)
   if (CANVAS_ACTIONS.has(action.type)) return handleCanvasActions(action, tabId)
   if (TAB_ACTIONS.has(action.type)) return handleTabActions(action, tabId)

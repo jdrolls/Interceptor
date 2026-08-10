@@ -11,6 +11,7 @@
 import { existsSync } from "node:fs"
 import { SOCKET_PATH } from "../../shared/platform"
 import { ensureDaemon } from "../daemon-spawn"
+import { buildBrowserBlock, describeBinding } from "../lib/browser-binding"
 import {
   TAB_ACCUMULATION_LIMIT,
   detectRecentTimeouts,
@@ -79,6 +80,25 @@ async function runChecks(): Promise<Check[]> {
     }
   } else {
     checks.push({ name: "extension", ok: false, detail: "skipped — daemon not running" })
+  }
+
+  // Browser binding + Helium-first policy (dora-cc#1377).
+  //
+  // The check ALWAYS names the binary on the other end of the WebSocket, and
+  // fails only when a more-preferred browser is installed and a lesser one is
+  // bound — a machine with nothing but Chrome is compliant. Failing means
+  // `doctor` exits 1, which is the enforcement: the skill's preflight refuses
+  // to hand a Chrome binding to a verification run without the operator either
+  // fixing it or sanctioning it via INTERCEPTOR_PREFERRED_BROWSER.
+  if (process.platform === "darwin") {
+    const browser = await buildBrowserBlock()
+    checks.push({
+      name: "browser",
+      ok: browser.policyOk,
+      detail: browser.bound
+        ? `${describeBinding(browser.bound)} — ${browser.policyDetail}`
+        : browser.policyDetail,
+    })
   }
 
   const timeouts = detectRecentTimeouts(readEvents(), Date.now())

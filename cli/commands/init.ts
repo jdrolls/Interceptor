@@ -18,12 +18,13 @@
 import { ensureDaemon } from "../daemon-spawn"
 import {
   readStatusSnapshot,
-  detectConfiguredBrowsers,
   detectMacOSDefaultBrowser,
   formatStatus,
   snapshotToJson,
   type StatusSnapshot,
 } from "../lib/status-renderer"
+import { buildBrowserBlock } from "../lib/browser-binding"
+import type { BrowserId } from "../../shared/browsers"
 import { sendCommand } from "../transport"
 
 async function probe(): Promise<{ reachable: boolean; reason?: string }> {
@@ -54,16 +55,25 @@ export async function runInitCommand(filtered: string[]): Promise<null> {
 
   const snap: StatusSnapshot = readStatusSnapshot()
 
-  if (verbose && process.platform === "darwin") {
-    const configured = detectConfiguredBrowsers()
-    const sysDefault = detectMacOSDefaultBrowser()
+  // Browser block (#52 + dora-cc#1377) — the binding is reported unconditionally
+  // on macOS; `init` bootstraps the daemon, so naming the browser it came up
+  // against is part of "ready".
+  if (process.platform === "darwin") {
+    const block = await buildBrowserBlock()
+    const sysDefault = verbose ? detectMacOSDefaultBrowser() : null
     let matches: boolean | null = null
-    if (sysDefault && configured.length > 0) {
-      matches = configured.some(b => b === sysDefault) || (sysDefault === "chrome" || sysDefault === "brave")
-        ? configured.includes(sysDefault as "chrome" | "brave")
-        : false
+    if (sysDefault && block.configured.length > 0) {
+      matches = block.configured.includes(sysDefault as BrowserId)
     }
-    snap.browser = { configured, systemDefault: sysDefault, matches }
+    snap.browser = {
+      configured: block.configured,
+      systemDefault: sysDefault,
+      matches,
+      bound: block.bound,
+      preferred: block.preferred,
+      policyOk: block.policyOk,
+      policyDetail: block.policyDetail,
+    }
   }
   if (verbose && snap.daemon) {
     const p = await probe()

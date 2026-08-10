@@ -214,6 +214,9 @@ Recording (Session Monitor):
     --with-bodies                        (P1) Merge cached response bodies
 
 Meta:
-  interceptor status                         Check daemon status (local — no connection needed)
-  interceptor doctor [--json] [--fix]        Health preflight; --fix restarts a degraded daemon
+  interceptor status                         Daemon state + the browser binary it is bound to (local)
+  interceptor doctor [--json] [--fix]        Health preflight (incl. Helium-first browser policy);
+                                             --fix restarts a degraded daemon
+                                             INTERCEPTOR_PREFERRED_BROWSER=chrome sanctions a
+                                             non-preferred browser on this machine
   interceptor help                           This help text`

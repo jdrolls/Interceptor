@@ -23,6 +23,7 @@ while [[ $i -le $# ]]; do
     --skip-extension) SKIP_EXTENSION=1 ;;
     --brave)  BROWSER="brave" ;;
     --chrome) BROWSER="chrome" ;;
+    --helium) BROWSER="helium" ;;
     --profile)
       i=$((i + 1))
       PROFILE="${!i}"
@@ -52,9 +53,10 @@ while [[ $i -le $# ]]; do
        echo "  --full            Browser-only AND macOS bridge (LaunchAgent + AX +"
        echo "                    ScreenCaptureKit + Apple Events). macOS only."
        echo ""
-       echo "Browser:"
+       echo "Browser (preference order: helium > brave > chrome):"
+       echo "  --helium          Target Helium (preferred — honours --load-extension)"
        echo "  --brave           Target Brave Browser"
-       echo "  --chrome          Target Google Chrome"
+       echo "  --chrome          Target Google Chrome (branded builds ignore --load-extension)"
        echo "  --profile <name>  Profile directory name (e.g. \"Default\", \"Profile 2\")"
        echo "  --profiles        List available profiles and exit"
        echo ""
@@ -69,11 +71,13 @@ done
 # ── List profiles ──────────────────────────────────────────────────────────────
 if [[ "$LIST_PROFILES" == "1" ]]; then
   if [[ -z "$BROWSER" ]]; then
-    if [[ -d "/Applications/Brave Browser.app" ]]; then BROWSER="brave"
+    if [[ -d "/Applications/Helium.app" ]]; then BROWSER="helium"
+    elif [[ -d "/Applications/Brave Browser.app" ]]; then BROWSER="brave"
     elif [[ -d "/Applications/Google Chrome.app" ]]; then BROWSER="chrome"
     fi
   fi
   case "$BROWSER" in
+    helium) PROFILE_ROOT="$HOME/Library/Application Support/net.imput.helium" ;;
     brave)  PROFILE_ROOT="$HOME/Library/Application Support/BraveSoftware/Brave-Browser" ;;
     chrome) PROFILE_ROOT="$HOME/Library/Application Support/Google/Chrome" ;;
     *) echo "No supported browser found."; exit 1 ;;
@@ -91,7 +95,7 @@ if [[ "$LIST_PROFILES" == "1" ]]; then
     fi
   done
   echo ""
-  echo "Usage: bash scripts/install.sh --brave --profile \"Profile 2\""
+  echo "Usage: bash scripts/install.sh --helium --profile \"Profile 2\""
   exit 0
 fi
 
@@ -142,40 +146,58 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 # ── Browser resolution ────────────────────────────────────────────────────────
-# If neither --chrome nor --brave was passed, prompt or fall back to a
-# deterministic default in non-interactive contexts. Valid resolved values:
-#   "chrome" | "brave" | "both"
+# If no browser flag was passed, resolve by PREFERENCE ORDER over what is
+# actually installed: helium > brave > chrome. Valid resolved values:
+#   "helium" | "chrome" | "brave" | "both"
+#
+# The old rule was "default to chrome", which is how a machine running Helium
+# ended up with its manifest in Chrome and every verification run launching a
+# Chrome nobody wanted (dora-cc#1377). Chrome is last on purpose: branded Chrome
+# desktop builds ignore --load-extension (see the notice load_extension prints),
+# so the unpacked extension has to be re-loaded by hand there. This order is the
+# same one `shared/browsers.ts` enforces in `interceptor doctor`.
 if [[ -z "$BROWSER" ]]; then
+  HELIUM_INSTALLED=0
   CHROME_INSTALLED=0
   BRAVE_INSTALLED=0
+  [[ -d "/Applications/Helium.app" ]] && HELIUM_INSTALLED=1
   [[ -d "/Applications/Google Chrome.app" ]] && CHROME_INSTALLED=1
   [[ -d "/Applications/Brave Browser.app" ]] && BRAVE_INSTALLED=1
+  INSTALLED_COUNT=$(( HELIUM_INSTALLED + CHROME_INSTALLED + BRAVE_INSTALLED ))
 
-  if (( CHROME_INSTALLED + BRAVE_INSTALLED == 0 )); then
+  # Most-preferred installed browser.
+  PREFERRED=""
+  if   (( HELIUM_INSTALLED )); then PREFERRED="helium"
+  elif (( BRAVE_INSTALLED ));  then PREFERRED="brave"
+  elif (( CHROME_INSTALLED )); then PREFERRED="chrome"
+  fi
+
+  if (( INSTALLED_COUNT == 0 )); then
     echo "ERROR: No supported browser found in /Applications/." >&2
-    echo "       Install Google Chrome or Brave Browser, then re-run." >&2
+    echo "       Install Helium, Brave Browser, or Google Chrome, then re-run." >&2
     exit 1
   fi
 
-  if (( CHROME_INSTALLED + BRAVE_INSTALLED == 1 )); then
-    [[ "$CHROME_INSTALLED" == "1" ]] && BROWSER="chrome" || BROWSER="brave"
+  if (( INSTALLED_COUNT == 1 )); then
+    BROWSER="$PREFERRED"
     echo "==> Browser: $BROWSER (only supported browser found)"
   elif [[ "$DRY_RUN" == "1" || ! -t 0 ]]; then
-    BROWSER="chrome"
-    echo "==> Browser not specified; defaulting to '$BROWSER' (non-interactive)."
+    BROWSER="$PREFERRED"
+    echo "==> Browser not specified; choosing '$BROWSER' by preference order (non-interactive)."
   else
     echo ""
-    echo "Choose target browser:"
-    echo "  chrome   Google Chrome"
-    echo "  brave    Brave Browser"
-    echo "  both     Install for both"
+    echo "Choose target browser (preference order: helium > brave > chrome):"
+    (( HELIUM_INSTALLED )) && echo "  helium   Helium (preferred)"
+    (( CHROME_INSTALLED )) && echo "  chrome   Google Chrome"
+    (( BRAVE_INSTALLED ))  && echo "  brave    Brave Browser"
+    echo "  both     Install for Chrome and Brave"
     echo ""
-    read -r -p "Browser [chrome/brave/both] (default: chrome): " ANSWER
-    ANSWER="${ANSWER:-chrome}"
+    read -r -p "Browser [helium/chrome/brave/both] (default: $PREFERRED): " ANSWER
+    ANSWER="${ANSWER:-$PREFERRED}"
     case "$ANSWER" in
-      chrome|brave|both) BROWSER="$ANSWER" ;;
+      helium|chrome|brave|both) BROWSER="$ANSWER" ;;
       *)
-        echo "Unrecognized browser '$ANSWER'. Use chrome, brave, or both." >&2
+        echo "Unrecognized browser '$ANSWER'. Use helium, chrome, brave, or both." >&2
         exit 1 ;;
     esac
   fi
@@ -207,6 +229,7 @@ fi
 echo "==> [browser] Installing native messaging symlink(s)..."
 NM_DIRS=()
 case "$BROWSER" in
+  helium) NM_DIRS+=("$HOME/Library/Application Support/net.imput.helium/NativeMessagingHosts") ;;
   chrome) NM_DIRS+=("$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts") ;;
   brave)  NM_DIRS+=("$HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts") ;;
   both)
@@ -223,8 +246,9 @@ for dir in "${NM_DIRS[@]}"; do
     mkdir -p "$dir"
     ln -sfn "$GENERATED_MANIFEST" "$dir/com.interceptor.host.json"
     case "$dir" in
-      *Google/Chrome*) echo "    Chrome: $dir/com.interceptor.host.json" ;;
-      *Brave-Browser*) echo "    Brave:  $dir/com.interceptor.host.json" ;;
+      *net.imput.helium*) echo "    Helium: $dir/com.interceptor.host.json" ;;
+      *Google/Chrome*)    echo "    Chrome: $dir/com.interceptor.host.json" ;;
+      *Brave-Browser*)    echo "    Brave:  $dir/com.interceptor.host.json" ;;
     esac
   fi
 done
@@ -250,6 +274,11 @@ load_extension() {
 
   local BROWSER_APP BROWSER_BIN BROWSER_NAME
   case "$target" in
+    helium)
+      BROWSER_APP="/Applications/Helium.app"
+      BROWSER_BIN="$BROWSER_APP/Contents/MacOS/Helium"
+      BROWSER_NAME="Helium"
+      ;;
     brave)
       BROWSER_APP="/Applications/Brave Browser.app"
       BROWSER_BIN="$BROWSER_APP/Contents/MacOS/Brave Browser"
@@ -338,7 +367,7 @@ load_extension() {
 }
 
 case "$BROWSER" in
-  chrome|brave) load_extension "$BROWSER" ;;
+  helium|chrome|brave) load_extension "$BROWSER" ;;
   both)
     load_extension chrome
     load_extension brave
